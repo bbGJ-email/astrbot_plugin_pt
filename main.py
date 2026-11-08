@@ -1,11 +1,12 @@
 import re
 import time
 import asyncio
+import ipaddress
 import math
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from PIL import Image
 import aiohttp
@@ -151,13 +152,38 @@ class TouchHeadPlugin(star.Star):
 
     @staticmethod
     def _normalize_user_key(value) -> str:
-        """把平台用户标识归一化后再比较（去掉 @ 前缀、空白，统一小写）。"""
-        return str(value or "").strip().lstrip("@").strip().lower()
+        """把平台用户标识归一化后再比较。
+
+        同一用户在「机器人自身标识」与「At 组件字段」两处的表示形态经常不同：
+        Telegram 可能是 ``@My_Bot`` / ``my_bot`` / ``MyBot``，飞书是 ``ou_xxx``，
+        这里去掉 @ 前缀、所有空白与下划线/连字符等分隔符并转小写，
+        避免因表示形态差异把机器人自己当成被摸对象
+        （PR #18 审查：self-mention-detection-gap）。
+        """
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", "", text).lstrip("@")
+        return re.sub(r"[-_.:]", "", text)
 
     def _is_same_user(self, left, right) -> bool:
         left_key = self._normalize_user_key(left)
         right_key = self._normalize_user_key(right)
         return bool(left_key) and left_key == right_key
+
+    @staticmethod
+    async def _json_or_none(resp, action: str):
+        """读取接口返回的 JSON；网关错误页 / HTML 等非 JSON 响应不抛异常。
+
+        各平台接口在 5xx、代理拦截、限流页下会返回 HTML，直接
+        ``await resp.json()`` 会抛 ContentTypeError 并冒泡成笼统的
+        “无法获取头像”（PR #18 审查：unhandled-non-json-response）。
+        """
+        try:
+            return await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"{action} 返回非 JSON 响应，已按失败处理: {e}")
+            return None
 
     @staticmethod
     def _redact_secrets(text) -> str:
@@ -173,40 +199,92 @@ class TouchHeadPlugin(star.Star):
             result = re.sub(pattern, repl, result, flags=re.IGNORECASE)
         return result
 
+    @staticmethod
+    def _sanitize_avatar_url(url) -> Optional[str]:
+        """校验平台返回的头像地址，拒绝内网 / 本机 / 非 http(s) 目标。
+
+        Slack、飞书等接口返回的 URL 会直接交给 `_download_image` 下载，
+        必须避免被指向 127.0.0.1、169.254.x、内网段等地址
+        （PR #18 审查：untrusted-download-url）。
+        这里不做域名白名单：飞书/Lark 头像走多套 CDN 域名且带签名参数，
+        硬编码白名单会误伤线上环境；真正的风险是被指向内网，故按目标地址拦截。
+        """
+        if not isinstance(url, str) or not url.strip():
+            return None
+        raw = url.strip()
+        try:
+            parsed = urlparse(raw)
+        except Exception:
+            logger.warning("头像地址解析失败，已忽略")
+            return None
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            logger.warning(f"头像地址协议不受支持，已忽略: {parsed.scheme or '(空)'}")
+            return None
+        if parsed.username or parsed.password:
+            logger.warning("头像地址包含用户凭据信息，已忽略")
+            return None
+        host = parsed.hostname.strip("[]").strip().lower().rstrip(".")
+        if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+            logger.warning(f"头像地址指向本机/内网主机名，已忽略: {host}")
+            return None
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return raw
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            logger.warning(f"头像地址指向受限 IP 段，已忽略: {ip}")
+            return None
+        return raw
+
     def _resolve_mentioned_user(
         self, event: AstrMessageEvent
     ) -> Optional[Tuple[str, str]]:
         """返回首个被 @ 用户；无目标返回 None，无效提及抛出 ValueError。"""
         is_qq = self._platform_kind(event) == "qq"
         self_id = ""
+        # 机器人自身标识可能有多种来源/形态（get_self_id、message_obj.self_id），
+        # 全部归一化后一起用于「是否 @ 了机器人自己」的判定。
+        self_keys = set()
+
+        def _add_self_key(value):
+            key = self._normalize_user_key(value)
+            if key:
+                self_keys.add(key)
+
         try:
             raw_self = str(event.get_self_id() or "").strip()
         except Exception as e:
             logger.debug(f"get_self_id 不可用: {e}")
             raw_self = ""
+        message_self = ""
+        try:
+            message_obj = getattr(event, "message_obj", None)
+            message_self = str(getattr(message_obj, "self_id", "") or "").strip()
+        except Exception as e:
+            logger.debug(f"从 message_obj.self_id 解析失败: {e}")
+            message_self = ""
+
         if is_qq:
             # QQ 平台：保持原有纯数字语义（前导零归一）。
-            self_id = raw_self.lstrip("0")
-            if not re.fullmatch(r"[0-9]+", self_id):
-                try:
-                    message_obj = getattr(event, "message_obj", None)
-                    self_id = str(getattr(message_obj, "self_id", "") or "").strip().lstrip("0")
-                except Exception as e:
-                    logger.debug(f"从 message_obj.self_id 回退解析失败: {e}")
-                    self_id = ""
-            if not re.fullmatch(r"[0-9]+", self_id):
-                self_id = ""
+            for candidate in (raw_self, message_self):
+                candidate = candidate.lstrip("0")
+                if re.fullmatch(r"[0-9]+", candidate):
+                    self_id = candidate
+                    _add_self_key(candidate)
+                    break
         else:
             # 非 QQ 平台（telegram/lark/slack 等）：self_id 是平台用户标识，
             # 不要求纯数字（telegram 是 bot 用户名）。
-            self_id = raw_self
-            if not self_id:
-                try:
-                    message_obj = getattr(event, "message_obj", None)
-                    self_id = str(getattr(message_obj, "self_id", "") or "").strip()
-                except Exception as e:
-                    logger.debug(f"从 message_obj.self_id 回退解析失败: {e}")
-                    self_id = ""
+            self_id = raw_self or message_self
+            for candidate in (raw_self, message_self):
+                _add_self_key(candidate)
 
         has_command_text = False
         # 非 QQ 平台命令前的 @ 无法确认是不是机器人自身，先记为候选目标：
@@ -238,9 +316,10 @@ class TouchHeadPlugin(star.Star):
 
             # 命令前用于唤醒机器人的 @ 会保留在消息链中。
             if not has_command_text:
-                if not self_id:
+                if not self_id and not self_keys:
                     raise ValueError("无法识别机器人账号，请使用 /摸摸 @用户 明确指定目标。")
-                if self._is_same_user(target_id, self_id):
+                if self._is_self_key(target_id, self_keys):
+                    logger.debug(f"命令前的提及 {target_id} 是机器人自身，已跳过")
                     continue
                 if not is_qq:
                     # 非 QQ 平台的 At 标识与 get_self_id 可能使用不同表示
@@ -255,7 +334,19 @@ class TouchHeadPlugin(star.Star):
                     continue
             return target_id, component.name or target_id
 
+        if fallback is not None and self._is_self_key(fallback[0], self_keys):
+            # 采用候选目标前再比对一次：命令前唯一那个 @ 若就是机器人自身，
+            # 宁可返回“未指定目标”，也不要生成“自己摸自己”的 GIF。
+            logger.debug(f"候选目标 {fallback[0]} 判定为机器人自身，已丢弃")
+            return None
         return fallback
+
+    def _is_self_key(self, value, self_keys) -> bool:
+        """判断某个 @ 标识是否指向机器人自身（按归一化后的多种形态比对）。"""
+        key = self._normalize_user_key(value)
+        if not key:
+            return False
+        return key in self_keys
 
     # --- 核心功能实现 ---
 
@@ -294,7 +385,7 @@ class TouchHeadPlugin(star.Star):
             if user_image is None:
                 kind = self._platform_kind(event)
                 return event.plain_result(
-                    f"抱歉，无法获取头像，无法生成摸头杀图片（{self._avatar_unavailable_reason(kind)}）。"
+                    f"抱歉，无法获取头像，无法生成摸头杀图片（{self._avatar_unavailable_reason(kind, target_id)}）。"
                 )
 
             gif_path = await asyncio.to_thread(
@@ -331,18 +422,24 @@ class TouchHeadPlugin(star.Star):
         if not url:
             logger.warning(
                 f"平台 {kind or '未知'} 暂无法获取用户 {user_id} 的头像"
-                f"（{self._avatar_unavailable_reason(kind)}）"
+                f"（{self._avatar_unavailable_reason(kind, user_id)}）"
             )
             return None
         # Telegram 的文件下载地址里带有 Bot Token，日志里必须脱敏。
         logger.info(f"下载用户头像（平台 {kind or '未知'}）: {self._redact_secrets(url)}")
         return await self._download_image(url)
 
-    def _avatar_unavailable_reason(self, kind: str) -> str:
+    def _avatar_unavailable_reason(self, kind: str, target_id: str = "") -> str:
         """头像不可用时给管理员的配置指引。"""
         if kind == "qq":
             return "QQ 头像接口异常"
         if kind == "telegram":
+            if target_id and not re.fullmatch(r"-?[0-9]+", str(target_id).strip()):
+                # 目标不是数字 user_id：这是用法问题，不是配置问题，提示要说清楚。
+                return (
+                    "Telegram 目标需为数字 user_id（Bot API 不支持用 @用户名 查询），"
+                    "请改用数字 ID @ 目标，或先让对方在本群发言后再指定"
+                )
             return "请在插件配置 platform_tokens.telegram_bot_token 填写 Bot Token"
         if kind == "discord":
             return "请在插件配置 platform_tokens.discord_bot_token 填写 Bot Token"
@@ -400,8 +497,11 @@ class TouchHeadPlugin(star.Star):
     async def _telegram_avatar_url(
         self, event: AstrMessageEvent, user_id: str
     ) -> Optional[str]:
-        """Telegram：getChatMember 解析数字 id（支持 @用户名）→
-        getUserProfilePhotos → getFile → 公开文件地址。需 Bot Token。"""
+        """Telegram：getUserProfilePhotos → getFile → 公开文件地址。需 Bot Token。
+
+        Telegram Bot API 的 ``user_id`` 只接受数字 ID（int64），At 组件里的
+        ``@用户名`` 无法直接使用（PR #18 审查：invalid-api-parameter）。
+        """
         token = self._platform_config("telegram_bot_token")
         if not token:
             return None
@@ -409,37 +509,21 @@ class TouchHeadPlugin(star.Star):
         session = self._require_session()
         # At 里通常是 @用户名，先换算成数字 user_id
         if not re.fullmatch(r"-?[0-9]+", user_id):
-            chat_id = ""
-            try:
-                chat_id = str(event.get_group_id() or "")
-            except Exception:
-                pass
-            if not chat_id:
-                logger.warning("Telegram 解析头像需要群聊上下文（get_group_id 为空）")
-                return None
-            async with session.get(
-                f"{base}/getChatMember",
-                params={"chat_id": chat_id, "user_id": user_id},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                status = resp.status
-                data = await resp.json(content_type=None)
-            result = self._telegram_result(data, status, "getChatMember")
-            if result is None:
-                return None
-            member = (result or {}).get("user") or {}
-            numeric = str(member.get("id") or "")
-            if not numeric:
-                logger.warning(f"Telegram getChatMember 未返回用户 id（user={user_id}）")
-                return None
-            user_id = numeric
+            # Telegram Bot API 的 getChatMember 只接受数字 user_id（int64），且没有
+            # 公开的「@用户名 → user_id」换算接口，直接传 @用户名 会 400。
+            # 这里不发无效请求，改为给出可操作的提示（PR #18 审查：invalid-api-parameter）。
+            logger.warning(
+                f"Telegram 目标 {user_id} 不是数字 user_id，无法解析头像；"
+                "请改为 @数字ID，或让对方先在本群发言后用数字 ID 指定"
+            )
+            return None
         async with session.get(
             f"{base}/getUserProfilePhotos",
             params={"user_id": user_id, "limit": 1},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             status = resp.status
-            data = await resp.json(content_type=None)
+            data = await self._json_or_none(resp, "Telegram getUserProfilePhotos")
         result = self._telegram_result(data, status, "getUserProfilePhotos")
         if result is None:
             return None
@@ -454,7 +538,7 @@ class TouchHeadPlugin(star.Star):
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             status = resp.status
-            data = await resp.json(content_type=None)
+            data = await self._json_or_none(resp, "Telegram getFile")
         result = self._telegram_result(data, status, "getFile")
         if result is None:
             return None
@@ -478,7 +562,7 @@ class TouchHeadPlugin(star.Star):
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             status = resp.status
-            data = await resp.json(content_type=None)
+            data = await self._json_or_none(resp, "Discord 用户查询")
         # 只有拿到带 id 的用户对象才继续，错误响应不能当成用户处理。
         if status != 200 or not isinstance(data, dict) or not data.get("id"):
             code = data.get("code") if isinstance(data, dict) else None
@@ -509,7 +593,7 @@ class TouchHeadPlugin(star.Star):
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             status = resp.status
-            data = await resp.json(content_type=None)
+            data = await self._json_or_none(resp, "Slack users.info")
         # Slack 用 HTTP 200 + ok=false 表达失败（无效 Token / 缺 users:read）。
         if status != 200 or not isinstance(data, dict) or data.get("ok") is not True:
             error = data.get("error") if isinstance(data, dict) else None
@@ -517,9 +601,9 @@ class TouchHeadPlugin(star.Star):
             return None
         profile = ((data or {}).get("user") or {}).get("profile") or {}
         for key in ("image_192", "image_512", "image_240", "image_original"):
-            url = profile.get(key)
+            url = self._sanitize_avatar_url(profile.get(key))
             if url:
-                return str(url)
+                return url
         return None
 
     async def _feishu_avatar_url(self, user_id: str) -> Optional[str]:
@@ -538,7 +622,7 @@ class TouchHeadPlugin(star.Star):
             json={"app_id": app_id, "app_secret": app_secret},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
-            data = await resp.json(content_type=None)
+            data = await self._json_or_none(resp, "飞书 tenant_access_token")
         token = (data or {}).get("tenant_access_token")
         if not token:
             logger.warning(f"飞书 tenant_access_token 获取失败: code={((data or {}).get('code'))}")
@@ -551,7 +635,7 @@ class TouchHeadPlugin(star.Star):
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             status = resp.status
-            data = await resp.json(content_type=None)
+            data = await self._json_or_none(resp, "飞书用户查询")
         if status != 200 or not isinstance(data, dict) or data.get("code") not in (0, None):
             logger.warning(
                 f"飞书用户查询失败: status={status} code={((data or {}).get('code'))}"
@@ -562,10 +646,10 @@ class TouchHeadPlugin(star.Star):
         # 飞书不同版本/接口返回的头像形态不一致：可能是 avatar 字典
         # （avatar_240 等分辨率字段），也可能是 avatar 字符串或 avatar_url。
         if isinstance(avatar, str) and avatar.strip():
-            return avatar.strip()
+            return self._sanitize_avatar_url(avatar)
         direct_url = user.get("avatar_url")
         if isinstance(direct_url, str) and direct_url.strip():
-            return direct_url.strip()
+            return self._sanitize_avatar_url(direct_url)
         if isinstance(avatar, dict):
             # 按分辨率从高到低兜底。
             for key in (
@@ -578,8 +662,9 @@ class TouchHeadPlugin(star.Star):
                 "avatar_96",
                 "avatar_72",
             ):
-                if avatar.get(key):
-                    return str(avatar[key])
+                url = self._sanitize_avatar_url(avatar.get(key))
+                if url:
+                    return url
         return None
 
     async def _download_image(self, url: str) -> Optional[Image.Image]:

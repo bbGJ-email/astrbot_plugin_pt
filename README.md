@@ -27,7 +27,7 @@ AstrBot 摸头杀插件 - 当用户拍机器人时自动生成并发送摸头GIF
 - ✅ 飞书 / Lark（需填写 `platform_tokens.feishu_app_id` 与 `feishu_app_secret`）
 - ⚠️ 微信官方平台不提供用户头像，无法生成摸头 GIF
 
-非 QQ 平台上 `/摸摸 @用户` 中的 @ 标识为各平台的用户标识（Telegram 为 @用户名、飞书为 open_id、Slack 为成员 ID 等），插件会自动识别并按平台调用对应接口拉取头像生成 GIF。头像获取失败时会在回复中给出对应的配置提示。
+非 QQ 平台上 `/摸摸 @用户` 中的 @ 标识为各平台的用户标识（Telegram 为 @用户名、飞书为 open_id、Slack 为成员 ID 等），插件会自动识别并按平台调用对应接口拉取头像生成 GIF。头像获取失败时会在回复中给出对应的配置提示。注意 Telegram Bot API 只接受数字 user_id，没有公开的「@用户名 → 数字 ID」换算接口，因此 Telegram 上直接 @用户名 会提示改用数字 ID；可先让目标在本群发言，再用其数字 ID 指定。
 
 ## 安装
 
@@ -41,7 +41,7 @@ AstrBot 摸头杀插件 - 当用户拍机器人时自动生成并发送摸头GIF
 ## 技术实现
 
 - 使用 Pillow 库本地生成GIF动画
-- 按平台获取用户头像：QQ 走官方头像 API；Telegram 走 Bot API（getChatMember / getUserProfilePhotos / getFile）；Discord 走 REST API（含默认头像回退）；Slack 走 users.info；飞书走 tenant_access_token + contact 接口
+- 按平台获取用户头像：QQ 走官方头像 API；Telegram 走 Bot API（getUserProfilePhotos / getFile，目标需为数字 user_id）；Discord 走 REST API（含默认头像回退）；Slack 走 users.info；飞书走 tenant_access_token + contact 接口
 - 监听 OneBot v11 协议的 `notice.notify.poke` 事件
 - 使用 base64 编码发送图片，兼容性更好
 

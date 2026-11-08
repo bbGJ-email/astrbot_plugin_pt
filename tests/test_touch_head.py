@@ -421,6 +421,15 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(kind=kind):
                 self.assertIn(keyword, self.plugin._avatar_unavailable_reason(kind))
 
+    def test_telegram_reason_distinguishes_username_from_bad_config(self):
+        # 目标写成 @用户名 时属于用法问题，提示不能只说“去填 Token”。
+        reason = self.plugin._avatar_unavailable_reason("telegram", "@target_user")
+        self.assertIn("数字 user_id", reason)
+        self.assertNotIn("telegram_bot_token", reason)
+        self.assertIn(
+            "telegram_bot_token", self.plugin._avatar_unavailable_reason("telegram", "987654")
+        )
+
     async def test_avatar_failure_message_includes_platform_hint(self):
         self.plugin._download_image = AsyncMock(return_value=None)
         event = PlatformEvent([Plain("/摸摸")], "weixin")
@@ -443,6 +452,8 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
 
     def test_user_key_normalization(self):
         self.assertTrue(self.plugin._is_same_user("@MyBot", "mybot"))
+        self.assertTrue(self.plugin._is_same_user("My_Bot", "@mybot"))
+        self.assertTrue(self.plugin._is_same_user(" ou_8C9D ", "OU_8c9d"))
         self.assertTrue(self.plugin._is_same_user(" 100001 ", "100001"))
         self.assertFalse(self.plugin._is_same_user("", ""))
         self.assertFalse(self.plugin._is_same_user("@alice", "@bob"))
@@ -487,20 +498,86 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             url, "https://api.telegram.org/file/bot123:abc/photos/x.jpg"
         )
 
-    async def test_telegram_resolves_username_via_get_chat_member(self):
+    async def test_telegram_rejects_non_numeric_user_id_without_request(self):
+        # Telegram Bot API 只接受数字 user_id，没有公开的「@用户名 → id」接口。
+        # 这里必须直接放弃，不能发出必然 400 的请求（PR #18 审查）。
         self.plugin.config = {"platform_tokens": {"telegram_bot_token": "123:abc"}}
+        self.plugin._session = FakeSession([])
+        event = PlatformEvent([Plain("/摸摸")], "telegram")
+        self.assertIsNone(await self.plugin._telegram_avatar_url(event, "@target_user"))
+        self.assertIsNone(await self.plugin._telegram_avatar_url(event, ""))
+        self.assertEqual(self.plugin._session.calls, [])
+
+    async def test_non_json_response_is_handled_gracefully(self):
+        # 网关错误页/HTML 会抛 ContentTypeError，应作为失败处理而不是冒泡。
+        class HtmlResponse(FakeResponse):
+            async def json(self, content_type=None):
+                raise ValueError("Attempt to decode JSON with unexpected mimetype")
+
+        self.plugin.config = {"platform_tokens": {"slack_bot_token": "xoxb-1"}}
+        self.plugin._session = FakeSession([HtmlResponse(502)])
+        self.assertIsNone(await self.plugin._slack_avatar_url("U0G9QF9C6"))
+
+        self.plugin.config = {"platform_tokens": {"telegram_bot_token": "123:abc"}}
+        self.plugin._session = FakeSession([HtmlResponse(502)])
+        event = PlatformEvent([Plain("/摸摸")], "telegram")
+        self.assertIsNone(await self.plugin._telegram_avatar_url(event, "987654"))
+
+    def test_avatar_url_sanitizer_blocks_internal_targets(self):
+        ok = self.plugin._sanitize_avatar_url
+        self.assertEqual(ok("https://cdn.example.com/a.png"), "https://cdn.example.com/a.png")
+        for bad in (
+            "http://127.0.0.1/a.png",
+            "http://localhost/a.png",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/a.png",
+            "http://[::1]/a.png",
+            "file:///etc/passwd",
+            "https://user:pw@cdn.example.com/a.png",
+            "",
+            None,
+        ):
+            with self.subTest(url=bad):
+                self.assertIsNone(ok(bad))
+
+    async def test_slack_avatar_url_internal_target_is_rejected(self):
+        self.plugin.config = {"platform_tokens": {"slack_bot_token": "xoxb-1"}}
         self.plugin._session = FakeSession(
             [
-                FakeResponse(200, {"ok": True, "result": {"user": {"id": 987654}}}),
-                FakeResponse(200, {"ok": True, "result": {"photos": [[{"file_id": "f1"}]]}}),
-                FakeResponse(200, {"ok": True, "result": {"file_path": "photos/x.jpg"}}),
+                FakeResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "user": {"profile": {"image_192": "http://169.254.169.254/x.png"}},
+                    },
+                )
             ]
         )
-        event = PlatformEvent([Plain("/摸摸")], "telegram")
-        event.get_group_id = lambda: "-100123"
-        url = await self.plugin._telegram_avatar_url(event, "@target_user")
-        self.assertTrue(url.endswith("photos/x.jpg"))
-        self.assertIn("getChatMember", self.plugin._session.calls[0][1])
+        self.assertIsNone(await self.plugin._slack_avatar_url("U0G9QF9C6"))
+
+    def test_non_qq_leading_mention_of_bot_itself_is_dropped(self):
+        # 命令前 @ 机器人自身时，@字段 与 self_id 常是不同写法（大小写/下划线/@前缀）。
+        for platform, at_id, self_id in (
+            ("telegram", "@My_Bot", "my_bot"),
+            ("telegram", "MyBot", "@mybot"),
+            ("slack", "U0G9QF9C6", "  u0g9qf9c6 "),
+            ("feishu", "ou_ABC123", "ou_abc123"),
+        ):
+            with self.subTest(platform=platform, at_id=at_id):
+                event = PlatformEvent(
+                    [At(qq=at_id, name="机器人"), Plain(" /摸摸")], platform, self_id=self_id
+                )
+                self.assertIsNone(self.plugin._resolve_mentioned_user(event))
+
+    def test_non_qq_command_self_mention_does_not_shadow_later_target(self):
+        event = PlatformEvent(
+            [At(qq="@My_Bot", name="机器人"), Plain(" /摸摸 "), At(qq="@target", name="目标")],
+            "telegram",
+            self_id="my_bot",
+        )
+        self.assertEqual(
+            self.plugin._resolve_mentioned_user(event), ("@target", "目标")
+        )
 
     async def test_telegram_error_response_returns_none(self):
         self.plugin.config = {"platform_tokens": {"telegram_bot_token": "bad"}}
