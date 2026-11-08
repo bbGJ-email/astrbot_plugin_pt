@@ -42,7 +42,7 @@ AstrBot 摸头杀插件 - 当用户拍机器人时自动生成并发送摸头GIF
 
 - 使用 Pillow 库本地生成GIF动画
 - 按平台获取用户头像：QQ 走官方头像 API；Telegram 走 Bot API（getUserProfilePhotos / getFile，目标需为数字 user_id）；Discord 走 REST API（含默认头像回退）；Slack 走 users.info；飞书走 tenant_access_token + contact 接口
-- 头像下载地址统一校验：按平台限定官方 CDN 域名，内网/本机/非 http(s) 目标直接拒绝
+- 头像下载地址统一校验：按平台限定官方 CDN 域名，内网/本机/非 http(s) 目标直接拒绝；下载阶段关闭自动重定向，每一跳都重新过校验，最多跟随 3 跳
 - 监听 OneBot v11 协议的 `notice.notify.poke` 事件
 - 使用 base64 编码发送图片，兼容性更好
 

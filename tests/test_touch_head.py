@@ -157,9 +157,7 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._build_petpet_gif.reset_mock()
         result = await self.plugin.handle_command(FakeEvent(messages))
         self.assertEqual(result, ("image", str(self.gif_path)))
-        self.plugin._download_image.assert_awaited_once_with(
-            f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-        )
+        _assert_avatar_downloaded(self, f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640")
         self.plugin._build_petpet_gif.assert_called_once_with(self.avatar, nickname)
 
     async def test_uses_typed_at_qq_and_name(self):
@@ -209,9 +207,7 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
                 event.get_self_id = Mock(side_effect=error)
                 result = await self.plugin.handle_command(event)
                 self.assertEqual(result, ("image", str(self.gif_path)))
-                self.plugin._download_image.assert_awaited_once_with(
-                    "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640"
-                )
+                _assert_avatar_downloaded(self, "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640")
 
     async def test_empty_or_invalid_self_id_uses_message_self_id(self):
         for self_id in (None, "", " ", "not-a-qq", "000"):
@@ -223,9 +219,7 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
                 event.get_self_id = Mock(return_value=self_id)
                 result = await self.plugin.handle_command(event)
                 self.assertEqual(result, ("image", str(self.gif_path)))
-                self.plugin._download_image.assert_awaited_once_with(
-                    "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640"
-                )
+                _assert_avatar_downloaded(self, "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640")
 
     async def test_unknown_self_id_rejects_ambiguous_leading_mention(self):
         for self_id in (None, "", "not-a-qq", "0"):
@@ -249,9 +243,7 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
                 event.get_self_id = Mock(side_effect=AttributeError("not available"))
                 result = await self.plugin.handle_command(event)
                 self.assertEqual(result, ("image", str(self.gif_path)))
-                self.plugin._download_image.assert_awaited_once_with(
-                    f"https://q1.qlogo.cn/g?b=qq&nk={target_id}&s=640"
-                )
+                _assert_avatar_downloaded(self, f"https://q1.qlogo.cn/g?b=qq&nk={target_id}&s=640")
 
     async def test_first_user_mention_is_selected(self):
         await self.assert_target(
@@ -297,9 +289,7 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
             result,
             ("text", "抱歉，无法获取头像，无法生成摸头杀图片（QQ 头像接口异常）。"),
         )
-        self.plugin._download_image.assert_awaited_once_with(
-            "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640"
-        )
+        _assert_avatar_downloaded(self, "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640")
         self.plugin._build_petpet_gif.assert_not_called()
 
 
@@ -312,19 +302,55 @@ class PlatformEvent(FakeEvent):
         return self._platform
 
 
+class FakeContent:
+    def __init__(self, data=b""):
+        self._data = data
+
+    async def iter_chunked(self, size):
+        for start in range(0, len(self._data), size):
+            yield self._data[start:start + size]
+
+
 class FakeResponse:
-    def __init__(self, status=200, payload=None):
+    """接口替身：带 headers 与 close()，便于校验重定向与下载阶段行为。"""
+
+    def __init__(self, status=200, payload=None, headers=None, body=b""):
         self.status = status
+        self.headers = dict(headers or {})
         self._payload = payload if payload is not None else {}
+        self.content = FakeContent(body)
+        self.content_length = len(body)
+        self.closed = False
 
     async def json(self, content_type=None):
         return self._payload
+
+    def close(self):
+        self.closed = True
+
+    def __await__(self):
+        # aiohttp 的 session.get() 既可 await 也可 async with，替身要两种都支持。
+        async def _self():
+            return self
+
+        return _self().__await__()
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *args):
         return False
+
+
+def _assert_avatar_downloaded(testcase, url):
+    """断言按给定地址下载头像。
+
+    kind 参数由实现侧决定（用于逐跳重定向复核），这里只校验下载地址本身，
+    避免断言把内部签名写死。
+    """
+    mocked = testcase.plugin._download_image
+    mocked.assert_awaited_once()
+    testcase.assertEqual(mocked.await_args.args[0], url)
 
 
 class FakeSession:
@@ -916,3 +942,254 @@ class GifGenerationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlatformRequestContractTests(unittest.IsolatedAsyncioTestCase):
+    """接口契约：请求地址、方法、参数写错时必须能被测试直接发现。
+
+    原来的 FakeSession 只回放响应、不校验请求，接口路径或参数写错也照样通过
+    （PR #18 审查：fake-session-does-not-validate-requests）。
+    """
+
+    def setUp(self):
+        self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
+        self.plugin._is_terminating = False
+        self.plugin._session = None
+
+    async def test_qq_avatar_url_contract(self):
+        event = PlatformEvent([Plain("摸摸")], "aiocqhttp")
+        self.assertEqual(
+            await self.plugin._resolve_avatar_url(event, "qq", "234567"),
+            "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640",
+        )
+
+    async def test_telegram_request_contract(self):
+        self.plugin.config = {"platform_tokens": {"telegram_bot_token": "1:abc"}}
+        session = FakeSession(
+            [
+                FakeResponse(200, {"ok": True, "result": {"photos": [[{"file_id": "f1"}]]}}),
+                FakeResponse(200, {"ok": True, "result": {"file_path": "photos/a.jpg"}}),
+            ]
+        )
+        self.plugin._session = session
+        event = PlatformEvent([Plain("摸摸")], "telegram")
+        url = await self.plugin._telegram_avatar_url(event, "987654")
+
+        self.assertEqual(url, "https://api.telegram.org/file/bot1:abc/photos/a.jpg")
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+        self.assertEqual(
+            session.calls[0][1], "https://api.telegram.org/bot1:abc/getUserProfilePhotos"
+        )
+        self.assertEqual(session.calls[0][2]["params"], {"user_id": "987654", "limit": 1})
+        self.assertEqual(
+            session.calls[1][1], "https://api.telegram.org/bot1:abc/getFile"
+        )
+        self.assertEqual(session.calls[1][2]["params"], {"file_id": "f1"})
+
+    async def test_discord_request_contract(self):
+        self.plugin.config = {"platform_tokens": {"discord_bot_token": "tok"}}
+        uid = "123456789012345678"
+        session = FakeSession([FakeResponse(200, {"id": uid, "avatar": "ab12"})])
+        self.plugin._session = session
+        url = await self.plugin._discord_avatar_url(uid)
+
+        self.assertEqual(
+            url, "https://cdn.discordapp.com/avatars/123456789012345678/ab12.png?size=256"
+        )
+        self.assertEqual(session.calls[0][1], "https://discord.com/api/v10/users/" + uid)
+        self.assertEqual(session.calls[0][2]["headers"]["Authorization"], "Bot tok")
+
+    async def test_slack_request_contract(self):
+        self.plugin.config = {"platform_tokens": {"slack_bot_token": "xoxb-1"}}
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "user": {
+                            "profile": {"image_192": "https://avatars.slack-edge.com/x.png"}
+                        },
+                    },
+                )
+            ]
+        )
+        self.plugin._session = session
+        url = await self.plugin._slack_avatar_url("U0G9QF9C6")
+
+        self.assertEqual(url, "https://avatars.slack-edge.com/x.png")
+        self.assertEqual(session.calls[0][0], "POST")
+        self.assertEqual(session.calls[0][1], "https://slack.com/api/users.info")
+        self.assertEqual(session.calls[0][2]["data"], {"user": "U0G9QF9C6"})
+        self.assertEqual(session.calls[0][2]["headers"]["Authorization"], "Bearer xoxb-1")
+
+    async def test_feishu_request_contract(self):
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id1", "feishu_app_secret": "sec1"}
+        }
+        session = FakeSession(
+            [
+                FakeResponse(200, {"code": 0, "tenant_access_token": "t-1"}),
+                FakeResponse(
+                    200,
+                    {
+                        "code": 0,
+                        "data": {
+                            "user": {
+                                "avatar": {
+                                    "avatar_240": "https://s1-imfile.feishucdn.com/a.png"
+                                }
+                            }
+                        },
+                    },
+                ),
+            ]
+        )
+        self.plugin._session = session
+        url = await self.plugin._feishu_avatar_url("ou_abc")
+
+        self.assertEqual(url, "https://s1-imfile.feishucdn.com/a.png")
+        self.assertEqual(
+            session.calls[0][1],
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        )
+        self.assertEqual(
+            session.calls[0][2]["json"], {"app_id": "id1", "app_secret": "sec1"}
+        )
+        self.assertEqual(
+            session.calls[1][1],
+            "https://open.feishu.cn/open-apis/contact/v3/users/ou_abc",
+        )
+        self.assertEqual(session.calls[1][2]["params"], {"user_id_type": "open_id"})
+        self.assertEqual(session.calls[1][2]["headers"]["Authorization"], "Bearer t-1")
+
+    async def test_telegram_negative_user_id_is_rejected_without_request(self):
+        # Telegram user_id 只可能是正整数，负数是 chat_id
+        # （PR #18 审查：telegram-user-id-sign）。
+        self.plugin.config = {"platform_tokens": {"telegram_bot_token": "1:abc"}}
+        session = FakeSession([])
+        self.plugin._session = session
+        event = PlatformEvent([Plain("摸摸")], "telegram")
+        self.assertIsNone(await self.plugin._telegram_avatar_url(event, "-100123"))
+        self.assertEqual(session.calls, [])
+        self.assertIn(
+            "数字 user_id", self.plugin._avatar_unavailable_base_reason("telegram", "-100123")
+        )
+
+    async def test_discord_default_avatar_follows_username_system(self):
+        # 官方规则：迁移到新用户名体系（discriminator 为 "0"）用 (id >> 22) % 6，
+        # 旧体系仍用 discriminator % 5
+        # （PR #18 审查：discord-default-avatar-index）。
+        self.plugin.config = {"platform_tokens": {"discord_bot_token": "tok"}}
+        uid = "123456789012345678"
+        for discriminator, expected in (("0", (int(uid) >> 22) % 6), ("1234", 1234 % 5)):
+            with self.subTest(discriminator=discriminator):
+                self.plugin._session = FakeSession(
+                    [
+                        FakeResponse(
+                            200,
+                            {"id": uid, "avatar": None, "discriminator": discriminator},
+                        )
+                    ]
+                )
+                self.assertEqual(
+                    await self.plugin._discord_avatar_url(uid),
+                    "https://cdn.discordapp.com/embed/avatars/{}.png".format(expected),
+                )
+
+    async def test_self_touch_on_unnamed_adapter_falls_back_to_qq(self):
+        # 未实现 get_platform_name 的适配器上，"摸摸"（无 @）也要能取到头像，
+        # 否则与"摸摸 @某人"行为不一致
+        # （PR #18 审查：self-avatar-unreachable-on-unnamed-adapter）。
+        class AnonymousEvent(PlatformEvent):
+            def get_platform_name(self):
+                raise AttributeError("adapter without get_platform_name")
+
+        self.plugin._download_image = AsyncMock(return_value="img")
+        event = AnonymousEvent([Plain("摸摸")], "", sender_id="234567")
+        self.assertEqual(self.plugin._effective_kind(event, "234567"), "qq")
+        self.assertEqual(await self.plugin._get_user_avatar_by_id(event, "234567"), "img")
+        _assert_avatar_downloaded(self, "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640")
+
+
+class AvatarDownloadRedirectTests(unittest.IsolatedAsyncioTestCase):
+    """下载阶段必须逐跳复核白名单（PR #18 审查：redirect-ssrf-bypass）。"""
+
+    AVATAR_URL = "https://cdn.discordapp.com/avatars/1/a.png"
+
+    def setUp(self):
+        self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
+        self.plugin._is_terminating = False
+        self.plugin._session = None
+
+    async def test_redirect_to_internal_address_is_rejected(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}
+                )
+            ]
+        )
+        self.plugin._session = session
+        self.assertIsNone(await self.plugin._download_image(self.AVATAR_URL, "discord"))
+        # 只在首跳发了请求，内网地址从未被访问
+        self.assertEqual(len(session.calls), 1)
+        self.assertFalse(session.calls[0][2]["allow_redirects"])
+
+    async def test_redirect_to_other_platform_host_is_rejected(self):
+        session = FakeSession(
+            [FakeResponse(307, headers={"Location": "https://evil.example.com/a.png"})]
+        )
+        self.plugin._session = session
+        self.assertIsNone(await self.plugin._download_image(self.AVATAR_URL, "discord"))
+        self.assertEqual(len(session.calls), 1)
+
+    async def test_allowed_redirect_is_refollowed_and_revalidated(self):
+        session = FakeSession(
+            [
+                FakeResponse(302, headers={"Location": "/avatars/2/b.png"}),
+                FakeResponse(200, headers={"Content-Type": "text/html"}, body=b"<html>"),
+            ]
+        )
+        self.plugin._session = session
+        self.assertIsNone(await self.plugin._download_image(self.AVATAR_URL, "discord"))
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(session.calls[1][1], "https://cdn.discordapp.com/avatars/2/b.png")
+        self.assertFalse(session.calls[1][2]["allow_redirects"])
+
+    async def test_too_many_redirects_gives_up(self):
+        responses = [
+            FakeResponse(302, headers={"Location": "/avatars/2/b.png"})
+            for _ in range(TouchHeadPlugin._MAX_AVATAR_REDIRECTS + 1)
+        ]
+        session = FakeSession(responses)
+        self.plugin._session = session
+        self.assertIsNone(await self.plugin._download_image(self.AVATAR_URL, "discord"))
+        self.assertEqual(len(session.calls), TouchHeadPlugin._MAX_AVATAR_REDIRECTS + 1)
+
+
+class AvatarHintLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
+
+    async def test_avatar_hint_is_consumed_once(self):
+        # 提示读完即清，不残留到后续回复
+        # （PR #18 审查：avatar-hint-leaks-across-tasks）。
+        plugin_module._AVATAR_HINT.set("飞书应用缺少通讯录权限")
+        self.assertIn("通讯录权限", self.plugin._avatar_unavailable_reason("feishu"))
+        self.assertNotIn("通讯录权限", self.plugin._avatar_unavailable_reason("feishu"))
+
+    async def test_unknown_kind_path_clears_previous_hint(self):
+        # kind 为 unknown 时不会进入 _resolve_avatar_url，提示必须在这里也被清掉。
+        plugin_module._AVATAR_HINT.set("飞书应用缺少通讯录权限")
+
+        async def fake_download(url, kind=""):
+            return None
+
+        self.plugin._download_image = fake_download
+        event = PlatformEvent([Plain("摸摸")], "some_new_platform")
+        self.assertIsNone(await self.plugin._get_user_avatar_by_id(event, "u1"))
+        self.assertEqual(plugin_module._AVATAR_HINT.get(), "")

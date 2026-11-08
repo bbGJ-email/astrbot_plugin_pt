@@ -7,7 +7,7 @@ import math
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 from PIL import Image
 import aiohttp
@@ -29,6 +29,11 @@ _AVATAR_HINT: contextvars.ContextVar = contextvars.ContextVar(
 
 class TouchHeadPlugin(star.Star):
     """摸头杀插件主类。"""
+
+    # 头像下载最多跟随几跳重定向，以及哪些状态码算重定向。
+    # 关闭 aiohttp 自动跟随，改成逐跳重新过白名单（PR #18 审查：redirect-ssrf-bypass）。
+    _MAX_AVATAR_REDIRECTS = 3
+    _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
     def __init__(self, context: star.Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -156,14 +161,16 @@ class TouchHeadPlugin(star.Star):
             return "weixin"
         return "unknown"
 
-    def _effective_kind(self, event: AstrMessageEvent) -> str:
+    def _effective_kind(self, event: AstrMessageEvent, target_id: str = "") -> str:
         """实际使用的平台策略：@ 解析与头像解析共用同一份判定。
 
         - 适配器有明确平台名 → 按名字走（不认识就是 unknown，不猜）；
-        - 适配器不上报平台名 → 只看消息里的 @ 标识形态：全部是纯数字才按 QQ
-          处理，其余按平台用户标识处理。不再依据"发送者 ID 是数字"单独切成
-          QQ，避免给非 QQ 用户去 QQ 头像服务取图
-          （PR #18 审查：platform-detection-fallback）。
+        - 适配器不上报平台名 → 先看消息里的 @ 标识形态，全部是纯数字才按 QQ
+          处理；没有 @ 目标（摸自己）时用 target_id 判断，否则「不带 @ 的摸摸」
+          在未实现 get_platform_name 的适配器上永远取不到头像，与带 @ 时行为
+          不一致（PR #18 审查：self-avatar-unreachable-on-unnamed-adapter）。
+        - 只有平台名缺失时才会用标识形态兜底，所以具名平台不会因为发送者 ID
+          是数字被误判成 QQ（PR #18 审查：platform-detection-fallback）。
         """
         kind = self._platform_kind(event)
         if kind != "unknown":
@@ -175,7 +182,13 @@ class TouchHeadPlugin(star.Star):
             for component in event.get_messages()
             if isinstance(component, At)
         ]
-        if at_ids and all(re.fullmatch(r"[0-9]+", value) for value in at_ids):
+        if at_ids:
+            if all(re.fullmatch(r"[0-9]+", value) for value in at_ids):
+                return "qq"
+            return "unknown"
+        # 无 @ 目标（摸自己）：按本次要取头像的那个标识形态兜底。qlogo 对不存在
+        # 的号码只会返回默认头像，代价很低，比"直接放弃"更符合用户预期。
+        if target_id and re.fullmatch(r"[0-9]+", str(target_id).strip()):
             return "qq"
         return "unknown"
 
@@ -466,7 +479,7 @@ class TouchHeadPlugin(star.Star):
         try:
             user_image = await self._get_user_avatar_by_id(event, target_id)
             if user_image is None:
-                kind = self._effective_kind(event)
+                kind = self._effective_kind(event, target_id)
                 return event.plain_result(
                     f"抱歉，无法获取头像，无法生成摸头杀图片（{self._avatar_unavailable_reason(kind, target_id)}）。"
                 )
@@ -493,7 +506,12 @@ class TouchHeadPlugin(star.Star):
     async def _get_user_avatar_by_id(
         self, event: AstrMessageEvent, user_id: str
     ) -> Optional[Image.Image]:
-        kind = self._effective_kind(event)
+        # 每次取头像前清空失败提示：contextvars 在任务内是复用的，只在
+        # _resolve_avatar_url 里清空会漏掉 unknown 等提前返回的分支，导致上一次
+        # 的飞书权限提示残留到本次回复（PR #18 审查：avatar-hint-leaks-across-tasks）。
+        _AVATAR_HINT.set("")
+        # 把本次目标标识交给判定：无 @ 目标时用它兜底平台（摸自己场景）。
+        kind = self._effective_kind(event, user_id)
         try:
             url = await self._resolve_avatar_url(event, kind, user_id)
         except Exception as e:
@@ -510,20 +528,23 @@ class TouchHeadPlugin(star.Star):
             return None
         # Telegram 的文件下载地址里带有 Bot Token，日志里必须脱敏。
         logger.info(f"下载用户头像（平台 {kind or '未知'}）: {self._redact_secrets(url)}")
-        return await self._download_image(url)
+        return await self._download_image(url, kind)
 
     def _avatar_unavailable_reason(self, kind: str, target_id: str = "") -> str:
-        """头像不可用时给管理员的配置指引。"""
+        """头像不可用时给管理员的配置指引（提示读完即清，避免跨次残留）。"""
         reason = self._avatar_unavailable_base_reason(kind, target_id)
         hint = str(_AVATAR_HINT.get() or "").strip()
+        _AVATAR_HINT.set("")
         return f"{reason}；{hint}" if hint else reason
 
     def _avatar_unavailable_base_reason(self, kind: str, target_id: str = "") -> str:
         if kind == "qq":
             return "QQ 头像接口异常"
         if kind == "telegram":
-            if target_id and not re.fullmatch(r"-?[0-9]+", str(target_id).strip()):
+            if target_id and not re.fullmatch(r"[0-9]+", str(target_id).strip()):
                 # 目标不是数字 user_id：这是用法问题，不是配置问题，提示要说清楚。
+                # Telegram 的 user_id 只可能是正整数，负数是 chat_id，别把它当成
+                # 合法用户标识（PR #18 审查：telegram-user-id-sign）。
                 return (
                     "Telegram 目标需为数字 user_id（Bot API 不支持用 @用户名 查询），"
                     "请改用数字 ID @ 目标，或先让对方在本群发言后再指定"
@@ -610,8 +631,10 @@ class TouchHeadPlugin(star.Star):
             return None
         base = f"https://api.telegram.org/bot{token}"
         session = self._require_session()
-        # At 里通常是 @用户名，先换算成数字 user_id
-        if not re.fullmatch(r"-?[0-9]+", user_id):
+        # At 里通常是 @用户名，先换算成数字 user_id。
+        # user_id 只接受正整数：负数是 chat_id，其它平台的用户标识也都不带符号，
+        # 统一按无符号数字校验（PR #18 审查：telegram-user-id-sign）。
+        if not re.fullmatch(r"[0-9]+", user_id):
             # Telegram Bot API 的 getChatMember 只接受数字 user_id（int64），且没有
             # 公开的「@用户名 → user_id」换算接口，直接传 @用户名 会 400。
             # 这里不发无效请求，改为给出可操作的提示（PR #18 审查：invalid-api-parameter）。
@@ -684,8 +707,18 @@ class TouchHeadPlugin(star.Star):
         if avatar:
             ext = ".gif" if str(avatar).startswith("a_") else ".png"
             return f"https://cdn.discordapp.com/avatars/{uid}/{quote(str(avatar), safe='')}{ext}?size=256"
+        # 默认头像索引按 Discord 官方规则分两套（2023-05-03 unique usernames 变更日志）：
+        # 已迁移到新用户名体系的用户（discriminator 为 "0"）用 (user_id >> 22) % 6；
+        # 旧体系用户仍用 discriminator % 5。只按前者算会让旧账号（以及仍留在旧
+        # 体系的 bot 账号）拿到与实际不一致的默认头像
+        # （PR #18 审查：discord-default-avatar-index）。
+        discriminator = str(data.get("discriminator") or "0").strip()
+        index = 0
         try:
-            index = (int(uid) >> 22) % 6
+            if discriminator.isdigit() and discriminator != "0":
+                index = int(discriminator) % 5
+            else:
+                index = (int(uid) >> 22) % 6
         except ValueError:
             index = 0
         return f"https://cdn.discordapp.com/embed/avatars/{index}.png"
@@ -785,13 +818,40 @@ class TouchHeadPlugin(star.Star):
                     return url
         return None
 
-    async def _download_image(self, url: str) -> Optional[Image.Image]:
+    async def _download_image(self, url: str, kind: str = "") -> Optional[Image.Image]:
         try:
             session = self._require_session()
 
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
+            # 关闭自动重定向并逐跳复核：白名单域若返回 302/307 指向 127.0.0.1、
+            # 169.254.169.254 或内网地址，aiohttp 默认会直接跟随，白名单只校验
+            # 首跳等于没校验（PR #18 审查：redirect-ssrf-bypass）。
+            target = url
+            response = None
+            for _hop in range(self._MAX_AVATAR_REDIRECTS + 1):
+                response = await session.get(
+                    target,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                location = response.headers.get("Location")
+                if response.status not in self._REDIRECT_STATUSES:
+                    break
+                response.close()
+                next_url = self._sanitize_avatar_url(
+                    urljoin(target, str(location or "")), kind
+                )
+                if not next_url:
+                    logger.warning(
+                        "头像地址重定向到非白名单目标，已放弃下载："
+                        f"{self._redact_secrets(location)}"
+                    )
+                    return None
+                target = next_url
+            else:
+                logger.warning("头像地址重定向层数过多，已放弃下载")
+                return None
+
+            async with response:
                 if response.status != 200:
                     logger.error(f"下载图片失败，HTTP状态码: {response.status}")
                     return None
