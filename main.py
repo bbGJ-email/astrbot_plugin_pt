@@ -20,9 +20,13 @@ Image.MAX_IMAGE_PIXELS = 10_000_000
 class TouchHeadPlugin(star.Star):
     """摸头杀插件主类。"""
 
-    def __init__(self, context: star.Context):
+    def __init__(self, context: star.Context, config=None):
         super().__init__(context)
         logger.info("摸头杀插件正在初始化...")
+
+        # AstrBot 按 _conf_schema.json 注入配置；保留引用以便运行时读取
+        # （issue #15：speed 配置此前从未被读取，属于无效配置）。
+        self.config = config
 
         self.data_dir = StarTools.get_data_dir()
         self.output_dir = self.data_dir / "output"
@@ -211,6 +215,35 @@ class TouchHeadPlugin(star.Star):
 
     # --- 头像获取与 GIF 生成 ---
 
+    def _patpat_speed(self) -> float:
+        """
+        读取摸头速度配置（issue #15）。非法/未配置回退 1.0（与 schema 默认一致），
+        并钳制在 schema 声明的 0.5 ~ 3.0 范围内，防止手滑填出极端值。
+        """
+        try:
+            patpat = self.config.get("patpat") or {}
+            raw = patpat.get("speed", 1.0)
+        except AttributeError:
+            # 测试或未注入 config 的场景：直接回退默认
+            return 1.0
+        except Exception as e:
+            logger.debug(f"读取摸头速度配置失败，回退默认: {e}")
+            return 1.0
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(value) or value <= 0:
+            return 1.0
+        return min(3.0, max(0.5, value))
+
+    def _frame_duration_ms(self) -> int:
+        """
+        speed 越大摸得越快：帧时长 = 基准 100ms / speed。
+        钳制在 20–500ms，避免 GIF 过快闪烁或过慢卡顿。
+        """
+        return int(min(500.0, max(20.0, 100.0 / self._patpat_speed())))
+
     async def _get_user_avatar_by_id(
         self, event: AstrMessageEvent, user_id: str
     ) -> Optional[Image.Image]:
@@ -329,7 +362,8 @@ class TouchHeadPlugin(star.Star):
                     output_path,
                     save_all=True,
                     append_images=frames[1:],
-                    duration=100,
+                    # issue #15：speed 配置实际控制帧时长（值越大摸得越快）。
+                    duration=self._frame_duration_ms(),
                     loop=0,
                     optimize=True,
                     disposal=2,

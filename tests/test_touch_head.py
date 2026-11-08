@@ -293,6 +293,36 @@ class GifGenerationTests(unittest.TestCase):
                 self.assertEqual(gif.info["duration"], 100)
                 gif.load()
 
+    def test_speed_config_controls_frame_duration(self):
+        # issue #15：speed 配置必须实际生效——值越大摸得越快（帧时长越短）。
+        for speed, expected_duration in ((2.0, 50), (0.5, 200), (1.0, 100)):
+            with self.subTest(speed=speed):
+                self.plugin.config = {"patpat": {"speed": speed}}
+                gif_path = self.plugin._build_petpet_gif(self.avatar, "target")
+                self.assertIsNotNone(gif_path)
+                with Image.open(gif_path) as gif:
+                    for index in range(gif.n_frames):
+                        gif.seek(index)
+                        self.assertEqual(gif.info["duration"], expected_duration)
+                        gif.load()
+
+    def test_speed_config_invalid_values_fall_back_to_default(self):
+        # 未配置 / 非法值回退默认（duration=100）；越界值钳制进 0.5~3.0。
+        cases = [
+            (None, 100),
+            ({}, 100),
+            ({"patpat": {}}, 100),
+            ({"patpat": {"speed": "abc"}}, 100),
+            ({"patpat": {"speed": 0}}, 100),
+            ({"patpat": {"speed": -1}}, 100),
+            ({"patpat": {"speed": 99}}, 33),   # 钳制到 3.0 → 100/3 ≈ 33ms
+            ({"patpat": {"speed": 0.1}}, 200),  # 钳制到 0.5 → 200ms
+        ]
+        for config, expected in cases:
+            with self.subTest(config=config, expected=expected):
+                self.plugin.config = config
+                self.assertEqual(self.plugin._frame_duration_ms(), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
