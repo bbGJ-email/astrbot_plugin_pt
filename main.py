@@ -209,6 +209,9 @@ class TouchHeadPlugin(star.Star):
                     self_id = ""
 
         has_command_text = False
+        # 非 QQ 平台命令前的 @ 无法确认是不是机器人自身，先记为候选目标：
+        # 命令文本之后若没有更明确的 @，就用回它，避免目标被静默丢弃。
+        fallback = None
         for component in event.get_messages():
             if isinstance(component, Plain) and component.text.strip():
                 has_command_text = True
@@ -242,14 +245,17 @@ class TouchHeadPlugin(star.Star):
                 if not is_qq:
                     # 非 QQ 平台的 At 标识与 get_self_id 可能使用不同表示
                     # （@用户名 vs 数字 ID），无法可靠判定是否为机器人自身；
-                    # 为避免把机器人当作被摸对象，命令前的提及一律跳过。
+                    # 为避免把机器人当作被摸对象，命令前的提及不直接采用，
+                    # 记为候选目标——后面没有更明确的 @ 时仍会用它。
+                    if fallback is None:
+                        fallback = (target_id, component.name or target_id)
                     logger.debug(
-                        f"跳过命令前的平台提及 {target_id}（无法确认是否为机器人自身）"
+                        f"命令前的平台提及 {target_id} 记为候选目标（无法确认是否为机器人自身）"
                     )
                     continue
             return target_id, component.name or target_id
 
-        return None
+        return fallback
 
     # --- 核心功能实现 ---
 
@@ -345,7 +351,7 @@ class TouchHeadPlugin(star.Star):
         if kind == "feishu":
             return "请在插件配置 platform_tokens 里填写 feishu_app_id 与 feishu_app_secret"
         if kind == "weixin":
-            return "微信官方平台不提供用户头像，只能摸自己的文字形象（无 GIF 头像）"
+            return "微信官方平台不提供用户头像，暂无法生成摸头 GIF"
         return "未知平台，未实现头像获取"
 
     async def _resolve_avatar_url(
@@ -365,9 +371,31 @@ class TouchHeadPlugin(star.Star):
         return None
 
     def _require_session(self) -> aiohttp.ClientSession:
+        """取共享 HTTP 会话。插件终止后不再新建，避免 terminate 之后出现
+        无人关闭的会话（PR #18 审查：resource-leak）。"""
+        if getattr(self, "_is_terminating", False):
+            raise RuntimeError("插件正在停止，已跳过头像请求")
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
+
+    @staticmethod
+    def _telegram_result(data, status: int, action: str):
+        """校验 Telegram Bot API 响应（HTTP 200 且 ok=true），返回 result。
+
+        只记录 error_code / description，不打印原始响应，避免把带 Token 的
+        请求信息带进日志（PR #18 审查：missing-response-validation）。
+        """
+        ok = isinstance(data, dict) and data.get("ok") is True
+        if status != 200 or not ok:
+            error_code = data.get("error_code") if isinstance(data, dict) else None
+            description = data.get("description") if isinstance(data, dict) else None
+            logger.warning(
+                f"Telegram {action} 失败: status={status} "
+                f"error_code={error_code} description={description}"
+            )
+            return None
+        return data.get("result")
 
     async def _telegram_avatar_url(
         self, event: AstrMessageEvent, user_id: str
@@ -394,11 +422,15 @@ class TouchHeadPlugin(star.Star):
                 params={"chat_id": chat_id, "user_id": user_id},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                status = resp.status
                 data = await resp.json(content_type=None)
-            member = ((data or {}).get("result") or {}).get("user") or {}
+            result = self._telegram_result(data, status, "getChatMember")
+            if result is None:
+                return None
+            member = (result or {}).get("user") or {}
             numeric = str(member.get("id") or "")
             if not numeric:
-                logger.warning(f"Telegram getChatMember 未返回用户 id: {data}")
+                logger.warning(f"Telegram getChatMember 未返回用户 id（user={user_id}）")
                 return None
             user_id = numeric
         async with session.get(
@@ -406,8 +438,12 @@ class TouchHeadPlugin(star.Star):
             params={"user_id": user_id, "limit": 1},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
+            status = resp.status
             data = await resp.json(content_type=None)
-        photos = ((data or {}).get("result") or {}).get("photos") or []
+        result = self._telegram_result(data, status, "getUserProfilePhotos")
+        if result is None:
+            return None
+        photos = result.get("photos") or []
         if not photos:
             return None
         file_id = photos[0][-1].get("file_id") if photos[0] else None
@@ -417,8 +453,12 @@ class TouchHeadPlugin(star.Star):
             f"{base}/getFile", params={"file_id": file_id},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
+            status = resp.status
             data = await resp.json(content_type=None)
-        file_path = ((data or {}).get("result") or {}).get("file_path")
+        result = self._telegram_result(data, status, "getFile")
+        if result is None:
+            return None
+        file_path = result.get("file_path")
         return f"https://api.telegram.org/file/bot{token}/{file_path}" if file_path else None
 
     async def _discord_avatar_url(self, user_id: str) -> Optional[str]:
@@ -468,7 +508,13 @@ class TouchHeadPlugin(star.Star):
             data={"user": user_id},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
+            status = resp.status
             data = await resp.json(content_type=None)
+        # Slack 用 HTTP 200 + ok=false 表达失败（无效 Token / 缺 users:read）。
+        if status != 200 or not isinstance(data, dict) or data.get("ok") is not True:
+            error = data.get("error") if isinstance(data, dict) else None
+            logger.warning(f"Slack users.info 失败: status={status} error={error}")
+            return None
         profile = ((data or {}).get("user") or {}).get("profile") or {}
         for key in ("image_192", "image_512", "image_240", "image_original"):
             url = profile.get(key)
@@ -512,28 +558,35 @@ class TouchHeadPlugin(star.Star):
             )
             return None
         user = (((data or {}).get("data") or {}).get("user")) or {}
-        avatar = user.get("avatar") or {}
-        # 飞书不同版本用户对象的头像字段名不一致，按分辨率从高到低兜底。
-        for key in (
-            "avatar_origin",
-            "avatar_640",
-            "avatar_big",
-            "avatar_240",
-            "avatar_middle",
-            "avatar_thumb",
-            "avatar_96",
-            "avatar_72",
-        ):
-            if avatar.get(key):
-                return str(avatar[key])
+        avatar = user.get("avatar")
+        # 飞书不同版本/接口返回的头像形态不一致：可能是 avatar 字典
+        # （avatar_240 等分辨率字段），也可能是 avatar 字符串或 avatar_url。
+        if isinstance(avatar, str) and avatar.strip():
+            return avatar.strip()
+        direct_url = user.get("avatar_url")
+        if isinstance(direct_url, str) and direct_url.strip():
+            return direct_url.strip()
+        if isinstance(avatar, dict):
+            # 按分辨率从高到低兜底。
+            for key in (
+                "avatar_origin",
+                "avatar_640",
+                "avatar_big",
+                "avatar_240",
+                "avatar_middle",
+                "avatar_thumb",
+                "avatar_96",
+                "avatar_72",
+            ):
+                if avatar.get(key):
+                    return str(avatar[key])
         return None
 
     async def _download_image(self, url: str) -> Optional[Image.Image]:
         try:
-            if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession()
+            session = self._require_session()
 
-            async with self._session.get(
+            async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status != 200:

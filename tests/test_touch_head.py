@@ -447,14 +447,121 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.plugin._is_same_user("", ""))
         self.assertFalse(self.plugin._is_same_user("@alice", "@bob"))
 
-    def test_non_qq_command_leading_mention_is_skipped(self):
-        # 命令前的 @ 在非 QQ 平台无法确认是否机器人自身，保守跳过，避免摸到机器人。
+    def test_non_qq_leading_mention_is_kept_as_candidate(self):
+        # 命令前的 @ 在非 QQ 平台无法确认是否机器人自身：不直接采用，
+        # 但也不丢——后面没有更明确的 @ 时用它。
         for platform in ("telegram", "feishu", "slack", "discord"):
             with self.subTest(platform=platform):
                 event = PlatformEvent(
-                    [At(qq="@some_bot"), Plain(" /摸摸")], platform
+                    [At(qq="@some_user", name="某人"), Plain(" /摸摸")], platform
                 )
-                self.assertIsNone(self.plugin._resolve_mentioned_user(event))
+                self.assertEqual(
+                    self.plugin._resolve_mentioned_user(event), ("@some_user", "某人")
+                )
+
+    def test_non_qq_later_mention_overrides_leading_candidate(self):
+        event = PlatformEvent(
+            [At(qq="@some_user", name="某人"), Plain(" /摸摸 "), At(qq="@target", name="目标")],
+            "telegram",
+        )
+        self.assertEqual(
+            self.plugin._resolve_mentioned_user(event), ("@target", "目标")
+        )
+
+    def test_require_session_refuses_after_terminate(self):
+        self.plugin._is_terminating = True
+        with self.assertRaises(RuntimeError):
+            self.plugin._require_session()
+
+    async def test_telegram_avatar_main_path(self):
+        self.plugin.config = {"platform_tokens": {"telegram_bot_token": "123:abc"}}
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"ok": True, "result": {"photos": [[{"file_id": "f1"}]]}}),
+                FakeResponse(200, {"ok": True, "result": {"file_path": "photos/x.jpg"}}),
+            ]
+        )
+        event = PlatformEvent([Plain("/摸摸")], "telegram")
+        url = await self.plugin._telegram_avatar_url(event, "987654")
+        self.assertEqual(
+            url, "https://api.telegram.org/file/bot123:abc/photos/x.jpg"
+        )
+
+    async def test_telegram_resolves_username_via_get_chat_member(self):
+        self.plugin.config = {"platform_tokens": {"telegram_bot_token": "123:abc"}}
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"ok": True, "result": {"user": {"id": 987654}}}),
+                FakeResponse(200, {"ok": True, "result": {"photos": [[{"file_id": "f1"}]]}}),
+                FakeResponse(200, {"ok": True, "result": {"file_path": "photos/x.jpg"}}),
+            ]
+        )
+        event = PlatformEvent([Plain("/摸摸")], "telegram")
+        event.get_group_id = lambda: "-100123"
+        url = await self.plugin._telegram_avatar_url(event, "@target_user")
+        self.assertTrue(url.endswith("photos/x.jpg"))
+        self.assertIn("getChatMember", self.plugin._session.calls[0][1])
+
+    async def test_telegram_error_response_returns_none(self):
+        self.plugin.config = {"platform_tokens": {"telegram_bot_token": "bad"}}
+        self.plugin._session = FakeSession(
+            [FakeResponse(401, {"ok": False, "error_code": 401, "description": "Unauthorized"})]
+        )
+        event = PlatformEvent([Plain("/摸摸")], "telegram")
+        self.assertIsNone(await self.plugin._telegram_avatar_url(event, "987654"))
+
+    async def test_slack_error_response_returns_none(self):
+        self.plugin.config = {"platform_tokens": {"slack_bot_token": "xoxb-1"}}
+        self.plugin._session = FakeSession(
+            [FakeResponse(200, {"ok": False, "error": "missing_scope"})]
+        )
+        self.assertIsNone(await self.plugin._slack_avatar_url("U0G9QF9C6"))
+
+    async def test_slack_avatar_main_path(self):
+        self.plugin.config = {"platform_tokens": {"slack_bot_token": "xoxb-1"}}
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {"ok": True, "user": {"profile": {"image_192": "https://slack/a.png"}}},
+                )
+            ]
+        )
+        self.assertEqual(
+            await self.plugin._slack_avatar_url("U0G9QF9C6"), "https://slack/a.png"
+        )
+
+    async def test_feishu_accepts_plain_string_avatar(self):
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id", "feishu_app_secret": "sec"}
+        }
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"tenant_access_token": "t-1"}),
+                FakeResponse(
+                    200, {"code": 0, "data": {"user": {"avatar": "https://feishu/plain.png"}}}
+                ),
+            ]
+        )
+        self.assertEqual(
+            await self.plugin._feishu_avatar_url("ou_abc123"), "https://feishu/plain.png"
+        )
+
+    async def test_feishu_accepts_avatar_url_field(self):
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id", "feishu_app_secret": "sec"}
+        }
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"tenant_access_token": "t-1"}),
+                FakeResponse(
+                    200, {"code": 0, "data": {"user": {"avatar_url": "https://feishu/url.png"}}}
+                ),
+            ]
+        )
+        self.assertEqual(
+            await self.plugin._feishu_avatar_url("ou_abc123"), "https://feishu/url.png"
+        )
 
     async def test_discord_rejects_non_snowflake_id(self):
         self.plugin.config = {"platform_tokens": {"discord_bot_token": "t"}}
