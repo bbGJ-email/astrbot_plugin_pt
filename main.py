@@ -44,6 +44,8 @@ class TouchHeadPlugin(star.Star):
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_terminating = False
         self._session: Optional[aiohttp.ClientSession] = None
+        # 平台接口返回的具体失败原因（如飞书缺通讯录权限），用于拼进用户提示。
+        self._avatar_hint = ""
 
         logger.info("摸头杀插件初始化完成。")
 
@@ -123,9 +125,18 @@ class TouchHeadPlugin(star.Star):
 
     def _platform_kind(self, event: AstrMessageEvent) -> str:
         """把 AstrBot 平台名归一为头像获取策略：qq/telegram/discord/slack/
-        feishu/weixin/unknown。用子串匹配兼容各版本的命名差异。"""
+        feishu/weixin/unknown。用子串匹配兼容各版本的命名差异。
+
+        平台名为空时返回 "unknown"（不代表 QQ）：AstrBot 里并非所有适配器都
+        实现 get_platform_name，早期版本把"拿不到平台名"当成 QQ，会让非 QQ
+        适配器误走 QQ 号校验并报"无法识别被 @ 用户的 QQ 号"
+        （PR #18 审查：platform-detection-fallback）。真正的兼容判断在
+        _effective_kind / _resolve_mentioned_user 里按 @ 标识形态做。
+        """
         name = self._platform_name(event)
-        if not name or "qq" in name or "aiocqhttp" in name:
+        if not name:
+            return "unknown"
+        if "qq" in name or "aiocqhttp" in name:
             return "qq"
         if "telegram" in name or name == "tg":
             return "telegram"
@@ -137,6 +148,22 @@ class TouchHeadPlugin(star.Star):
             return "feishu"
         if "weixin" in name or "wechat" in name or name.startswith("wx"):
             return "weixin"
+        return "unknown"
+
+    def _effective_kind(self, event: AstrMessageEvent, user_id: str = "") -> str:
+        """实际使用的平台策略：平台名缺失时按目标标识形态兼容判断。
+
+        - 适配器有明确平台名但不认识 → unknown（不猜，走中性提示）；
+        - 适配器不上报平台名 + 目标标识是纯数字 → 按 QQ 处理，兼容老适配器
+          与 aiocqhttp 之外的 QQ 协议端实现（PR #18 审查）。
+        """
+        kind = self._platform_kind(event)
+        if kind != "unknown":
+            return kind
+        if self._platform_name(event):
+            return "unknown"
+        if re.fullmatch(r"-?[0-9]+", str(user_id).strip()):
+            return "qq"
         return "unknown"
 
     def _platform_config(self, key: str) -> str:
@@ -199,15 +226,45 @@ class TouchHeadPlugin(star.Star):
             result = re.sub(pattern, repl, result, flags=re.IGNORECASE)
         return result
 
-    @staticmethod
-    def _sanitize_avatar_url(url) -> Optional[str]:
-        """校验平台返回的头像地址，拒绝内网 / 本机 / 非 http(s) 目标。
+    # 各平台头像 CDN 的白名单（子域匹配）。平台接口返回的 URL 会直接交给
+    # _download_image 下载，必须限定域名，避免被指向内网/本机
+    # （PR #18 审查：incomplete-ssrf-protection）。
+    # 只放必需域名：飞书/Lark 的头像走 feishucdn/lark 系列 CDN 且带签名参数，
+    # 因此按后缀放行而不是写死完整域名，兼容各区域节点。
+    _AVATAR_HOST_SUFFIXES = {
+        "qq": ("qlogo.cn", "qpic.cn"),
+        "telegram": ("api.telegram.org", "cdn.telegram.org"),
+        "discord": ("discordapp.com", "discordapp.net", "discord.com"),
+        "slack": ("slack.com", "slack-edge.com", "slack-imgs.com", "gravatar.com"),
+        "feishu": (
+            "feishu.cn",
+            "feishucdn.com",
+            "larksuite.com",
+            "larkoffice.com",
+            "larksuitecdn.com",
+        ),
+    }
 
-        Slack、飞书等接口返回的 URL 会直接交给 `_download_image` 下载，
-        必须避免被指向 127.0.0.1、169.254.x、内网段等地址
-        （PR #18 审查：untrusted-download-url）。
-        这里不做域名白名单：飞书/Lark 头像走多套 CDN 域名且带签名参数，
-        硬编码白名单会误伤线上环境；真正的风险是被指向内网，故按目标地址拦截。
+    @classmethod
+    def _host_allowed(cls, host: str, kind: str) -> bool:
+        suffixes = cls._AVATAR_HOST_SUFFIXES.get(kind)
+        if not suffixes:
+            # 未知平台：用全部已知域名兜底，宁可拒绝也不放行任意域名。
+            suffixes = tuple(
+                suffix
+                for group in cls._AVATAR_HOST_SUFFIXES.values()
+                for suffix in group
+            )
+        return any(host == s or host.endswith("." + s) for s in suffixes)
+
+    @classmethod
+    def _sanitize_avatar_url(cls, url, kind: str = "") -> Optional[str]:
+        """校验平台返回的头像地址：协议、凭据、域名白名单、受限 IP。
+
+        Slack、飞书、Telegram 等接口返回的 URL 会直接交给 `_download_image`
+        下载，必须挡住 127.0.0.1、169.254.x、内网段以及任意第三方域名——仅比对
+        IP 字面量不够（域名可以指向内网），因此按平台 CDN 白名单放行
+        （PR #18 审查：incomplete-ssrf-protection）。
         """
         if not isinstance(url, str) or not url.strip():
             return None
@@ -230,8 +287,8 @@ class TouchHeadPlugin(star.Star):
         try:
             ip = ipaddress.ip_address(host)
         except ValueError:
-            return raw
-        if (
+            ip = None
+        if ip is not None and (
             ip.is_private
             or ip.is_loopback
             or ip.is_link_local
@@ -241,6 +298,11 @@ class TouchHeadPlugin(star.Star):
         ):
             logger.warning(f"头像地址指向受限 IP 段，已忽略: {ip}")
             return None
+        if not cls._host_allowed(host, kind):
+            logger.warning(
+                f"头像地址域名不在 {kind or '已知'} 平台白名单内，已忽略: {host}"
+            )
+            return None
         return raw
 
     def _resolve_mentioned_user(
@@ -248,6 +310,18 @@ class TouchHeadPlugin(star.Star):
     ) -> Optional[Tuple[str, str]]:
         """返回首个被 @ 用户；无目标返回 None，无效提及抛出 ValueError。"""
         is_qq = self._platform_kind(event) == "qq"
+        if not is_qq and self._platform_kind(event) == "unknown" and not self._platform_name(event):
+            # 适配器不上报平台名（老版本 / 自定义适配器）时无法直接判定平台：
+            # @ 标识全为纯数字才按 QQ 语义处理，否则按平台用户标识处理，
+            # 避免非 QQ 适配器误报「无法识别被 @ 用户的 QQ 号」。
+            at_ids = [
+                str(component.qq).strip()
+                for component in event.get_messages()
+                if isinstance(component, At)
+            ]
+            is_qq = bool(at_ids) and all(
+                re.fullmatch(r"[0-9]+", value) for value in at_ids
+            )
         self_id = ""
         # 机器人自身标识可能有多种来源/形态（get_self_id、message_obj.self_id），
         # 全部归一化后一起用于「是否 @ 了机器人自己」的判定。
@@ -383,7 +457,7 @@ class TouchHeadPlugin(star.Star):
         try:
             user_image = await self._get_user_avatar_by_id(event, target_id)
             if user_image is None:
-                kind = self._platform_kind(event)
+                kind = self._effective_kind(event, target_id)
                 return event.plain_result(
                     f"抱歉，无法获取头像，无法生成摸头杀图片（{self._avatar_unavailable_reason(kind, target_id)}）。"
                 )
@@ -410,7 +484,7 @@ class TouchHeadPlugin(star.Star):
     async def _get_user_avatar_by_id(
         self, event: AstrMessageEvent, user_id: str
     ) -> Optional[Image.Image]:
-        kind = self._platform_kind(event)
+        kind = self._effective_kind(event, user_id)
         try:
             url = await self._resolve_avatar_url(event, kind, user_id)
         except Exception as e:
@@ -431,6 +505,11 @@ class TouchHeadPlugin(star.Star):
 
     def _avatar_unavailable_reason(self, kind: str, target_id: str = "") -> str:
         """头像不可用时给管理员的配置指引。"""
+        reason = self._avatar_unavailable_base_reason(kind, target_id)
+        hint = str(getattr(self, "_avatar_hint", "") or "").strip()
+        return f"{reason}；{hint}" if hint else reason
+
+    def _avatar_unavailable_base_reason(self, kind: str, target_id: str = "") -> str:
         if kind == "qq":
             return "QQ 头像接口异常"
         if kind == "telegram":
@@ -454,17 +533,32 @@ class TouchHeadPlugin(star.Star):
     async def _resolve_avatar_url(
         self, event: AstrMessageEvent, kind: str, user_id: str
     ) -> Optional[str]:
-        """按平台解析用户头像的公开下载地址；无法获取返回 None（issue #16）。"""
+        """按平台解析用户头像的公开下载地址；无法获取返回 None（issue #16）。
+
+        所有平台的头像地址统一经 `_sanitize_avatar_url` 出口校验（含 QQ /
+        Telegram 这类由本插件拼出来的地址），新增平台时不会漏掉域名约束
+        （PR #18 审查：incomplete-ssrf-protection）。
+        """
+        # 每次解析前清空上一轮的失败提示，避免把旧提示带进新的回复。
+        self._avatar_hint = ""
         if kind == "qq":
-            return f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
+            # QQ 号必须是纯数字，避免把任意标识拼进请求参数。
+            if not re.fullmatch(r"[0-9]+", str(user_id).strip()):
+                logger.warning(f"QQ 目标标识非法，跳过头像获取: {user_id!r}")
+                return None
+            return self._sanitize_avatar_url(
+                f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640", kind
+            )
         if kind == "telegram":
-            return await self._telegram_avatar_url(event, user_id)
+            return self._sanitize_avatar_url(
+                await self._telegram_avatar_url(event, user_id), kind
+            )
         if kind == "discord":
-            return await self._discord_avatar_url(user_id)
+            return self._sanitize_avatar_url(await self._discord_avatar_url(user_id), kind)
         if kind == "slack":
-            return await self._slack_avatar_url(user_id)
+            return self._sanitize_avatar_url(await self._slack_avatar_url(user_id), kind)
         if kind == "feishu":
-            return await self._feishu_avatar_url(user_id)
+            return self._sanitize_avatar_url(await self._feishu_avatar_url(user_id), kind)
         return None
 
     def _require_session(self) -> aiohttp.ClientSession:
@@ -543,7 +637,15 @@ class TouchHeadPlugin(star.Star):
         if result is None:
             return None
         file_path = result.get("file_path")
-        return f"https://api.telegram.org/file/bot{token}/{file_path}" if file_path else None
+        # file_path 会被拼进下载 URL，先校验形态，避免带出 ../../ 或额外参数。
+        if (
+            not isinstance(file_path, str)
+            or not re.fullmatch(r"[A-Za-z0-9_./-]+", file_path)
+            or ".." in file_path
+        ):
+            logger.warning(f"Telegram 返回的文件路径异常，已忽略: {file_path!r}")
+            return None
+        return f"https://api.telegram.org/file/bot{token}/{file_path}"
 
     async def _discord_avatar_url(self, user_id: str) -> Optional[str]:
         """Discord：GET /users/{id}（需 Bot Token）→ cdn 头像；无自定义头像
@@ -601,7 +703,7 @@ class TouchHeadPlugin(star.Star):
             return None
         profile = ((data or {}).get("user") or {}).get("profile") or {}
         for key in ("image_192", "image_512", "image_240", "image_original"):
-            url = self._sanitize_avatar_url(profile.get(key))
+            url = self._sanitize_avatar_url(profile.get(key), "slack")
             if url:
                 return url
         return None
@@ -637,19 +739,26 @@ class TouchHeadPlugin(star.Star):
             status = resp.status
             data = await self._json_or_none(resp, "飞书用户查询")
         if status != 200 or not isinstance(data, dict) or data.get("code") not in (0, None):
-            logger.warning(
-                f"飞书用户查询失败: status={status} code={((data or {}).get('code'))}"
-            )
+            code = (data or {}).get("code") if isinstance(data, dict) else None
+            logger.warning(f"飞书用户查询失败: status={status} code={code}")
+            if status == 403 or code in (403, 41050, 99991672, 99991679):
+                # 自建应用默认没有通讯录权限，返回 403/41050 时提示要开通权限，
+                # 否则用户只会看到笼统的「去填 app_id/app_secret」
+                # （PR #18 审查：feishu-permission-hint）。
+                self._avatar_hint = (
+                    "飞书应用缺少通讯录权限：请在开放平台开通 "
+                    "contact:user.base:readonly 等权限并发布版本"
+                )
             return None
         user = (((data or {}).get("data") or {}).get("user")) or {}
         avatar = user.get("avatar")
         # 飞书不同版本/接口返回的头像形态不一致：可能是 avatar 字典
         # （avatar_240 等分辨率字段），也可能是 avatar 字符串或 avatar_url。
         if isinstance(avatar, str) and avatar.strip():
-            return self._sanitize_avatar_url(avatar)
+            return self._sanitize_avatar_url(avatar, "feishu")
         direct_url = user.get("avatar_url")
         if isinstance(direct_url, str) and direct_url.strip():
-            return self._sanitize_avatar_url(direct_url)
+            return self._sanitize_avatar_url(direct_url, "feishu")
         if isinstance(avatar, dict):
             # 按分辨率从高到低兜底。
             for key in (
@@ -662,7 +771,7 @@ class TouchHeadPlugin(star.Star):
                 "avatar_96",
                 "avatar_72",
             ):
-                url = self._sanitize_avatar_url(avatar.get(key))
+                url = self._sanitize_avatar_url(avatar.get(key), "feishu")
                 if url:
                     return url
         return None

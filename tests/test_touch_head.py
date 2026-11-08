@@ -57,6 +57,9 @@ class FakeEvent:
     def get_self_id(self):
         return self.message_obj.self_id
 
+    def get_platform_name(self):
+        return "aiocqhttp"
+
     def plain_result(self, text):
         return "text", text
 
@@ -350,7 +353,7 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
 
     def test_platform_kind_mapping(self):
         for platform, kind in (
-            ("", "qq"),  # 未提供平台名的适配器沿用 QQ 语义
+            ("", "unknown"),  # 平台名缺失：不能默认当 QQ（见 _effective_kind）
             ("aiocqhttp", "qq"),
             ("qq_official", "qq"),
             ("telegram", "telegram"),
@@ -366,6 +369,26 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(platform=platform):
                 event = PlatformEvent([Plain("/摸摸")], platform)
                 self.assertEqual(self.plugin._platform_kind(event), kind)
+
+    def test_unnamed_platform_falls_back_to_qq_only_for_numeric_ids(self):
+        # 适配器不实现 get_platform_name 时，按 @ 标识形态兼容判断：
+        # 纯数字按 QQ 处理、非纯数字按平台标识处理（PR #18 审查）。
+        class AnonymousEvent(PlatformEvent):
+            def get_platform_name(self):
+                raise AttributeError("adapter without get_platform_name")
+
+        for target, expected in (("234567", "qq"), ("@user", "unknown"), ("", "unknown")):
+            with self.subTest(target=target):
+                event = AnonymousEvent([Plain("/摸摸")], "")
+                self.assertEqual(self.plugin._effective_kind(event, target), expected)
+
+        # 非 QQ 适配器不再被套上 QQ 号校验并抛「无法识别 QQ 号」
+        event = AnonymousEvent([Plain("/摸摸 "), At(qq="@someone", name="某人")], "")
+        self.assertEqual(self.plugin._resolve_mentioned_user(event), ("@someone", "某人"))
+
+    def test_named_unknown_platform_is_not_treated_as_qq(self):
+        event = PlatformEvent([Plain("/摸摸")], "some_new_platform")
+        self.assertEqual(self.plugin._effective_kind(event, "234567"), "unknown")
 
     def test_non_qq_platform_accepts_non_numeric_at_id(self):
         for platform, target in (
@@ -383,9 +406,9 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_avatar_url_dispatches_to_platform_resolver(self):
         event = PlatformEvent([Plain("/摸摸")], "telegram")
-        self.plugin._telegram_avatar_url = AsyncMock(return_value="https://t.example/a.jpg")
+        self.plugin._telegram_avatar_url = AsyncMock(return_value="https://api.telegram.org/file/bot1/a.jpg")
         url = await self.plugin._resolve_avatar_url(event, "telegram", "@user")
-        self.assertEqual(url, "https://t.example/a.jpg")
+        self.assertEqual(url, "https://api.telegram.org/file/bot1/a.jpg")
         self.plugin._telegram_avatar_url.assert_awaited_once_with(event, "@user")
 
     async def test_avatar_url_resolvers_require_credentials(self):
@@ -525,7 +548,14 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
 
     def test_avatar_url_sanitizer_blocks_internal_targets(self):
         ok = self.plugin._sanitize_avatar_url
-        self.assertEqual(ok("https://cdn.example.com/a.png"), "https://cdn.example.com/a.png")
+        self.assertEqual(
+            ok("https://avatars.slack-edge.com/a.png", "slack"),
+            "https://avatars.slack-edge.com/a.png",
+        )
+        self.assertEqual(
+            ok("https://q1.qlogo.cn/g?b=qq&nk=1&s=640", "qq"),
+            "https://q1.qlogo.cn/g?b=qq&nk=1&s=640",
+        )
         for bad in (
             "http://127.0.0.1/a.png",
             "http://localhost/a.png",
@@ -534,11 +564,33 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             "http://[::1]/a.png",
             "file:///etc/passwd",
             "https://user:pw@cdn.example.com/a.png",
+            # 域名不在该平台白名单内（含指向内网的第三方域名）一律拒绝
+            "https://cdn.example.com/a.png",
+            "https://evil-slack.com/a.png",
             "",
             None,
         ):
             with self.subTest(url=bad):
-                self.assertIsNone(ok(bad))
+                self.assertIsNone(ok(bad, "slack"))
+
+    def test_avatar_url_sanitizer_rejects_other_platforms_hosts(self):
+        ok = self.plugin._sanitize_avatar_url
+        # 跨平台域名不放行：Slack 的结果不能指到 Discord/飞书 CDN。
+        self.assertIsNone(ok("https://cdn.discordapp.com/avatars/1/a.png", "slack"))
+        self.assertIsNone(ok("https://s1-imfile.feishucdn.com/a.png", "telegram"))
+        self.assertIsNotNone(ok("https://cdn.discordapp.com/embed/avatars/0.png", "discord"))
+
+    async def test_qq_avatar_url_requires_numeric_id(self):
+        event = PlatformEvent([Plain("/摸摸")], "aiocqhttp")
+        for bad in ("abc", "12&s=1", "", "../../x", "１２３"):
+            with self.subTest(target=bad):
+                self.assertIsNone(
+                    await self.plugin._resolve_avatar_url(event, "qq", bad)
+                )
+        self.assertEqual(
+            await self.plugin._resolve_avatar_url(event, "qq", "234567"),
+            "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640",
+        )
 
     async def test_slack_avatar_url_internal_target_is_rejected(self):
         self.plugin.config = {"platform_tokens": {"slack_bot_token": "xoxb-1"}}
@@ -600,12 +652,12 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             [
                 FakeResponse(
                     200,
-                    {"ok": True, "user": {"profile": {"image_192": "https://slack/a.png"}}},
+                    {"ok": True, "user": {"profile": {"image_192": "https://avatars.slack-edge.com/a.png"}}},
                 )
             ]
         )
         self.assertEqual(
-            await self.plugin._slack_avatar_url("U0G9QF9C6"), "https://slack/a.png"
+            await self.plugin._slack_avatar_url("U0G9QF9C6"), "https://avatars.slack-edge.com/a.png"
         )
 
     async def test_feishu_accepts_plain_string_avatar(self):
@@ -616,12 +668,12 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             [
                 FakeResponse(200, {"tenant_access_token": "t-1"}),
                 FakeResponse(
-                    200, {"code": 0, "data": {"user": {"avatar": "https://feishu/plain.png"}}}
+                    200, {"code": 0, "data": {"user": {"avatar": "https://s1-imfile.feishucdn.com/plain.png"}}}
                 ),
             ]
         )
         self.assertEqual(
-            await self.plugin._feishu_avatar_url("ou_abc123"), "https://feishu/plain.png"
+            await self.plugin._feishu_avatar_url("ou_abc123"), "https://s1-imfile.feishucdn.com/plain.png"
         )
 
     async def test_feishu_accepts_avatar_url_field(self):
@@ -632,12 +684,12 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             [
                 FakeResponse(200, {"tenant_access_token": "t-1"}),
                 FakeResponse(
-                    200, {"code": 0, "data": {"user": {"avatar_url": "https://feishu/url.png"}}}
+                    200, {"code": 0, "data": {"user": {"avatar_url": "https://s1-imfile.feishucdn.com/url.png"}}}
                 ),
             ]
         )
         self.assertEqual(
-            await self.plugin._feishu_avatar_url("ou_abc123"), "https://feishu/url.png"
+            await self.plugin._feishu_avatar_url("ou_abc123"), "https://s1-imfile.feishucdn.com/url.png"
         )
 
     async def test_discord_rejects_non_snowflake_id(self):
@@ -685,13 +737,13 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
                     200,
                     {
                         "code": 0,
-                        "data": {"user": {"avatar": {"avatar_big": "https://feishu/big.png"}}},
+                        "data": {"user": {"avatar": {"avatar_big": "https://s1-imfile.feishucdn.com/big.png"}}},
                     },
                 ),
             ]
         )
         self.assertEqual(
-            await self.plugin._feishu_avatar_url("ou_abc123"), "https://feishu/big.png"
+            await self.plugin._feishu_avatar_url("ou_abc123"), "https://s1-imfile.feishucdn.com/big.png"
         )
 
     async def test_feishu_error_code_returns_none(self):
@@ -705,6 +757,37 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         self.assertIsNone(await self.plugin._feishu_avatar_url("ou_abc123"))
+
+    async def test_feishu_permission_error_adds_actionable_hint(self):
+        # 自建应用常见 403/41050：提示必须指出缺通讯录权限，而不是只说去填凭据。
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id", "feishu_app_secret": "sec"}
+        }
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"tenant_access_token": "t-1"}),
+                FakeResponse(403, {"code": 41050, "msg": "no permission"}),
+            ]
+        )
+        event = PlatformEvent([Plain("/摸摸")], "feishu")
+        self.assertIsNone(await self.plugin._resolve_avatar_url(event, "feishu", "ou_abc123"))
+        reason = self.plugin._avatar_unavailable_reason("feishu", "ou_abc123")
+        self.assertIn("通讯录权限", reason)
+
+    async def test_telegram_weird_file_path_is_rejected(self):
+        self.plugin.config = {"platform_tokens": {"telegram_bot_token": "123:abc"}}
+        for file_path in ("../../etc/passwd", "photos/x.jpg?evil=1", "", "photos/x y.jpg"):
+            with self.subTest(file_path=file_path):
+                self.plugin._session = FakeSession(
+                    [
+                        FakeResponse(
+                            200, {"ok": True, "result": {"photos": [[{"file_id": "f1"}]]}}
+                        ),
+                        FakeResponse(200, {"ok": True, "result": {"file_path": file_path}}),
+                    ]
+                )
+                event = PlatformEvent([Plain("/摸摸")], "telegram")
+                self.assertIsNone(await self.plugin._telegram_avatar_url(event, "987654"))
 
 
 class GifGenerationTests(unittest.TestCase):
