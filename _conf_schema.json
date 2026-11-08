@@ -27,7 +27,7 @@
         "type": "string",
         "secret": true,
         "default": "",
-        "hint": "与 Telegram 平台适配器使用的 Bot 一致；用于 getChatMember/getUserProfilePhotos 拉取头像"
+        "hint": "与 Telegram 平台适配器使用的 Bot 一致；用于 getUserProfilePhotos/getFile 拉取头像"
       },
       "discord_bot_token": {
         "description": "Discord Bot Token",

@@ -651,7 +651,7 @@ class TouchHeadPlugin(star.Star):
         # user_id 只接受正整数：负数是 chat_id，其它平台的用户标识也都不带符号，
         # 统一按无符号数字校验（PR #18 审查：telegram-user-id-sign）。
         if not re.fullmatch(r"[0-9]+", user_id):
-            # Telegram Bot API 的 getChatMember 只接受数字 user_id（int64），且没有
+            # Telegram Bot API 的 getUserProfilePhotos 只接受数字 user_id（int64），且没有
             # 公开的「@用户名 → user_id」换算接口，直接传 @用户名 会 400。
             # 这里不发无效请求，改为给出可操作的提示（PR #18 审查：invalid-api-parameter）。
             logger.warning(
