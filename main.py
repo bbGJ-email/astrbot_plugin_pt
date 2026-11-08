@@ -1,6 +1,7 @@
 import re
 import time
 import asyncio
+import contextvars
 import ipaddress
 import math
 from io import BytesIO
@@ -17,6 +18,13 @@ from astrbot.api.message_components import At, AtAll, Plain
 from astrbot.api.star import StarTools
 
 Image.MAX_IMAGE_PIXELS = 10_000_000
+
+# 平台接口返回的具体失败提示（如飞书缺通讯录权限）。
+# 用 contextvars 而不是实例属性：同一插件实例会并发处理多个群/多个平台的请求，
+# 实例级变量会让提示互相清空或串味（PR #18 审查：shared-mutable-state-race）。
+_AVATAR_HINT: contextvars.ContextVar = contextvars.ContextVar(
+    "touch_head_avatar_hint", default=""
+)
 
 
 class TouchHeadPlugin(star.Star):
@@ -44,8 +52,6 @@ class TouchHeadPlugin(star.Star):
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_terminating = False
         self._session: Optional[aiohttp.ClientSession] = None
-        # 平台接口返回的具体失败原因（如飞书缺通讯录权限），用于拼进用户提示。
-        self._avatar_hint = ""
 
         logger.info("摸头杀插件初始化完成。")
 
@@ -235,7 +241,14 @@ class TouchHeadPlugin(star.Star):
         "qq": ("qlogo.cn", "qpic.cn"),
         "telegram": ("api.telegram.org", "cdn.telegram.org"),
         "discord": ("discordapp.com", "discordapp.net", "discord.com"),
-        "slack": ("slack.com", "slack-edge.com", "slack-imgs.com", "gravatar.com"),
+        # Slack 只放自家 CDN；头像走 Gravatar 时也只允许 secure.gravatar.com，
+        # 该域下不允许任意用户子域（PR #18 审查：allowlist-too-broad）。
+        "slack": (
+            "slack.com",
+            "slack-edge.com",
+            "slack-imgs.com",
+            "secure.gravatar.com",
+        ),
         "feishu": (
             "feishu.cn",
             "feishucdn.com",
@@ -249,12 +262,10 @@ class TouchHeadPlugin(star.Star):
     def _host_allowed(cls, host: str, kind: str) -> bool:
         suffixes = cls._AVATAR_HOST_SUFFIXES.get(kind)
         if not suffixes:
-            # 未知平台：用全部已知域名兜底，宁可拒绝也不放行任意域名。
-            suffixes = tuple(
-                suffix
-                for group in cls._AVATAR_HOST_SUFFIXES.values()
-                for suffix in group
-            )
+            # 未知/未识别的平台策略：不放行任何域名。_resolve_avatar_url 对这类
+            # 平台本就不返回地址，这里拒绝可避免"任一已知 CDN 都能被跨平台使用"
+            # 的弱化白名单（PR #18 审查：allowlist-too-broad）。
+            return False
         return any(host == s or host.endswith("." + s) for s in suffixes)
 
     @classmethod
@@ -347,12 +358,14 @@ class TouchHeadPlugin(star.Star):
 
         if is_qq:
             # QQ 平台：保持原有纯数字语义（前导零归一）。
+            # 两个来源都要计入 self_keys——get_self_id 有可能返回的不是机器人 QQ 号
+            # （例如群号），只取第一个合法值会让真正的 self_id 进不了自身判定，
+            # 仍可能出现"自己摸自己"（PR #18 审查：incomplete-self-id-resolution）。
             for candidate in (raw_self, message_self):
-                candidate = candidate.lstrip("0")
-                if re.fullmatch(r"[0-9]+", candidate):
-                    self_id = candidate
-                    _add_self_key(candidate)
-                    break
+                normalized = candidate.lstrip("0")
+                if re.fullmatch(r"[0-9]+", normalized):
+                    self_id = self_id or normalized
+                    _add_self_key(normalized)
         else:
             # 非 QQ 平台（telegram/lark/slack 等）：self_id 是平台用户标识，
             # 不要求纯数字（telegram 是 bot 用户名）。
@@ -506,7 +519,7 @@ class TouchHeadPlugin(star.Star):
     def _avatar_unavailable_reason(self, kind: str, target_id: str = "") -> str:
         """头像不可用时给管理员的配置指引。"""
         reason = self._avatar_unavailable_base_reason(kind, target_id)
-        hint = str(getattr(self, "_avatar_hint", "") or "").strip()
+        hint = str(_AVATAR_HINT.get() or "").strip()
         return f"{reason}；{hint}" if hint else reason
 
     def _avatar_unavailable_base_reason(self, kind: str, target_id: str = "") -> str:
@@ -539,8 +552,8 @@ class TouchHeadPlugin(star.Star):
         Telegram 这类由本插件拼出来的地址），新增平台时不会漏掉域名约束
         （PR #18 审查：incomplete-ssrf-protection）。
         """
-        # 每次解析前清空上一轮的失败提示，避免把旧提示带进新的回复。
-        self._avatar_hint = ""
+        # 每次解析前清空本次任务的失败提示（contextvars 按任务隔离，互不影响）。
+        _AVATAR_HINT.set("")
         if kind == "qq":
             # QQ 号必须是纯数字，避免把任意标识拼进请求参数。
             if not re.fullmatch(r"[0-9]+", str(user_id).strip()):
@@ -745,7 +758,7 @@ class TouchHeadPlugin(star.Star):
                 # 自建应用默认没有通讯录权限，返回 403/41050 时提示要开通权限，
                 # 否则用户只会看到笼统的「去填 app_id/app_secret」
                 # （PR #18 审查：feishu-permission-hint）。
-                self._avatar_hint = (
+                _AVATAR_HINT.set(
                     "飞书应用缺少通讯录权限：请在开放平台开通 "
                     "contact:user.base:readonly 等权限并发布版本"
                 )

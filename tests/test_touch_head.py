@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 import importlib.util
@@ -579,6 +580,37 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(ok("https://cdn.discordapp.com/avatars/1/a.png", "slack"))
         self.assertIsNone(ok("https://s1-imfile.feishucdn.com/a.png", "telegram"))
         self.assertIsNotNone(ok("https://cdn.discordapp.com/embed/avatars/0.png", "discord"))
+
+    def test_qq_self_id_prefers_message_self_id_when_getter_returns_group(self):
+        # get_self_id 返回的不是机器人 QQ 号（如群号）时，message_obj.self_id
+        # 仍需参与自身判定，否则命令前 @ 机器人会被当成被摸对象
+        # （PR #18 审查：incomplete-self-id-resolution）。
+        event = PlatformEvent([At(qq="100001"), Plain(" /摸摸")], "aiocqhttp")
+        event.get_self_id = Mock(return_value="999999")
+        self.assertIsNone(self.plugin._resolve_mentioned_user(event))
+
+    async def test_avatar_hint_is_task_local(self):
+        # 提示用 contextvars 承载：并发任务之间不共享，也不会互相清空
+        # （PR #18 审查：shared-mutable-state-race）。
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id", "feishu_app_secret": "sec"}
+        }
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"tenant_access_token": "t-1"}),
+                FakeResponse(403, {"code": 41050, "msg": "no permission"}),
+            ]
+        )
+        event = PlatformEvent([Plain("/摸摸")], "feishu")
+
+        async def read_hint():
+            await asyncio.sleep(0)
+            return self.plugin._avatar_unavailable_reason("feishu")
+
+        other = asyncio.create_task(read_hint())  # 创建时拷贝当前（空）上下文
+        await self.plugin._resolve_avatar_url(event, "feishu", "ou_abc123")
+        self.assertIn("通讯录权限", self.plugin._avatar_unavailable_reason("feishu"))
+        self.assertNotIn("通讯录权限", await other)
 
     async def test_qq_avatar_url_requires_numeric_id(self):
         event = PlatformEvent([Plain("/摸摸")], "aiocqhttp")
