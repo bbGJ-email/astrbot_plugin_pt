@@ -371,25 +371,29 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
                 event = PlatformEvent([Plain("/摸摸")], platform)
                 self.assertEqual(self.plugin._platform_kind(event), kind)
 
-    def test_unnamed_platform_falls_back_to_qq_only_for_numeric_ids(self):
-        # 适配器不实现 get_platform_name 时，按 @ 标识形态兼容判断：
-        # 纯数字按 QQ 处理、非纯数字按平台标识处理（PR #18 审查）。
+    def test_unnamed_platform_falls_back_to_qq_only_for_numeric_at_id(self):
+        # 适配器不实现 get_platform_name 时，只看消息里的 @ 标识形态：
+        # 全是纯数字才按 QQ 处理，其余按平台标识处理（PR #18 审查）。
         class AnonymousEvent(PlatformEvent):
             def get_platform_name(self):
                 raise AttributeError("adapter without get_platform_name")
 
-        for target, expected in (("234567", "qq"), ("@user", "unknown"), ("", "unknown")):
-            with self.subTest(target=target):
-                event = AnonymousEvent([Plain("/摸摸")], "")
-                self.assertEqual(self.plugin._effective_kind(event, target), expected)
+        for messages, expected in (
+            ([Plain("/摸摸 "), At(qq="234567")], "qq"),
+            ([Plain("/摸摸 "), At(qq="@user")], "unknown"),
+            ([Plain("/摸摸")], "unknown"),  # 没有 @ 目标时不能凭发送者 ID 猜 QQ
+        ):
+            with self.subTest(expected=expected):
+                event = AnonymousEvent(list(messages), "")
+                self.assertEqual(self.plugin._effective_kind(event), expected)
 
         # 非 QQ 适配器不再被套上 QQ 号校验并抛「无法识别 QQ 号」
         event = AnonymousEvent([Plain("/摸摸 "), At(qq="@someone", name="某人")], "")
         self.assertEqual(self.plugin._resolve_mentioned_user(event), ("@someone", "某人"))
 
     def test_named_unknown_platform_is_not_treated_as_qq(self):
-        event = PlatformEvent([Plain("/摸摸")], "some_new_platform")
-        self.assertEqual(self.plugin._effective_kind(event, "234567"), "unknown")
+        event = PlatformEvent([Plain("/摸摸 "), At(qq="234567")], "some_new_platform")
+        self.assertEqual(self.plugin._effective_kind(event), "unknown")
 
     def test_non_qq_platform_accepts_non_numeric_at_id(self):
         for platform, target in (

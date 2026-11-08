@@ -156,19 +156,26 @@ class TouchHeadPlugin(star.Star):
             return "weixin"
         return "unknown"
 
-    def _effective_kind(self, event: AstrMessageEvent, user_id: str = "") -> str:
-        """实际使用的平台策略：平台名缺失时按目标标识形态兼容判断。
+    def _effective_kind(self, event: AstrMessageEvent) -> str:
+        """实际使用的平台策略：@ 解析与头像解析共用同一份判定。
 
-        - 适配器有明确平台名但不认识 → unknown（不猜，走中性提示）；
-        - 适配器不上报平台名 + 目标标识是纯数字 → 按 QQ 处理，兼容老适配器
-          与 aiocqhttp 之外的 QQ 协议端实现（PR #18 审查）。
+        - 适配器有明确平台名 → 按名字走（不认识就是 unknown，不猜）；
+        - 适配器不上报平台名 → 只看消息里的 @ 标识形态：全部是纯数字才按 QQ
+          处理，其余按平台用户标识处理。不再依据"发送者 ID 是数字"单独切成
+          QQ，避免给非 QQ 用户去 QQ 头像服务取图
+          （PR #18 审查：platform-detection-fallback）。
         """
         kind = self._platform_kind(event)
         if kind != "unknown":
             return kind
         if self._platform_name(event):
             return "unknown"
-        if re.fullmatch(r"-?[0-9]+", str(user_id).strip()):
+        at_ids = [
+            str(component.qq).strip()
+            for component in event.get_messages()
+            if isinstance(component, At)
+        ]
+        if at_ids and all(re.fullmatch(r"[0-9]+", value) for value in at_ids):
             return "qq"
         return "unknown"
 
@@ -320,19 +327,8 @@ class TouchHeadPlugin(star.Star):
         self, event: AstrMessageEvent
     ) -> Optional[Tuple[str, str]]:
         """返回首个被 @ 用户；无目标返回 None，无效提及抛出 ValueError。"""
-        is_qq = self._platform_kind(event) == "qq"
-        if not is_qq and self._platform_kind(event) == "unknown" and not self._platform_name(event):
-            # 适配器不上报平台名（老版本 / 自定义适配器）时无法直接判定平台：
-            # @ 标识全为纯数字才按 QQ 语义处理，否则按平台用户标识处理，
-            # 避免非 QQ 适配器误报「无法识别被 @ 用户的 QQ 号」。
-            at_ids = [
-                str(component.qq).strip()
-                for component in event.get_messages()
-                if isinstance(component, At)
-            ]
-            is_qq = bool(at_ids) and all(
-                re.fullmatch(r"[0-9]+", value) for value in at_ids
-            )
+        # 平台策略只算一次，@ 解析与头像解析共用，避免两边判定不一致
+        is_qq = self._effective_kind(event) == "qq"
         self_id = ""
         # 机器人自身标识可能有多种来源/形态（get_self_id、message_obj.self_id），
         # 全部归一化后一起用于「是否 @ 了机器人自己」的判定。
@@ -470,7 +466,7 @@ class TouchHeadPlugin(star.Star):
         try:
             user_image = await self._get_user_avatar_by_id(event, target_id)
             if user_image is None:
-                kind = self._effective_kind(event, target_id)
+                kind = self._effective_kind(event)
                 return event.plain_result(
                     f"抱歉，无法获取头像，无法生成摸头杀图片（{self._avatar_unavailable_reason(kind, target_id)}）。"
                 )
@@ -497,7 +493,7 @@ class TouchHeadPlugin(star.Star):
     async def _get_user_avatar_by_id(
         self, event: AstrMessageEvent, user_id: str
     ) -> Optional[Image.Image]:
-        kind = self._effective_kind(event, user_id)
+        kind = self._effective_kind(event)
         try:
             url = await self._resolve_avatar_url(event, kind, user_id)
         except Exception as e:
