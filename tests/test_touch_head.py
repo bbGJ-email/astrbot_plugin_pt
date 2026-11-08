@@ -1224,3 +1224,71 @@ class AvatarHintLifetimeTests(unittest.IsolatedAsyncioTestCase):
         event = PlatformEvent([Plain("摸摸")], "some_new_platform")
         self.assertIsNone(await self.plugin._get_user_avatar_by_id(event, "u1"))
         self.assertEqual(plugin_module._AVATAR_HINT.get(), "")
+
+class PlatformKindConsistencyTests(unittest.IsolatedAsyncioTestCase):
+    """同一事件只能用一份平台判定（PR #18 审查：platform-kind-inconsistency）。"""
+
+    def setUp(self):
+        self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
+        self.plugin._is_terminating = False
+        self.plugin._session = None
+
+    def test_target_id_takes_precedence_over_mention_shape(self):
+        # 有明确目标时以目标标识为准：@ 里是不是数字不再决定平台
+        # （PR #18 审查：target-id-ignored-in-platform-fallback）。
+        class AnonymousEvent(PlatformEvent):
+            def get_platform_name(self):
+                raise AttributeError("adapter without get_platform_name")
+
+        event = AnonymousEvent([Plain("/摸摸 "), At(qq="@user")], "")
+        self.assertEqual(self.plugin._effective_kind(event, "234567"), "qq")
+        self.assertEqual(self.plugin._effective_kind(event, "@user"), "unknown")
+        # 没有目标时退回看 @ 形态（@解析阶段的判定入口）
+        self.assertEqual(self.plugin._effective_kind(event), "unknown")
+
+    async def test_handle_command_passes_single_kind_down(self):
+        avatar = Image.new("RGBA", (10, 10), "blue")
+        self.addCleanup(avatar.close)
+        self.plugin._get_user_avatar_by_id = AsyncMock(return_value=avatar)
+        self.plugin._build_petpet_gif = Mock(return_value=None)
+        self.plugin.assets_dir = Path(tempfile.gettempdir())
+        self.plugin._download_image = AsyncMock()
+
+        event = PlatformEvent([Plain("/摸摸 "), At(qq="234567")], "aiocqhttp")
+        await self.plugin.handle_command(event)
+
+        # 目标确定后算出的 kind 原样传下去，不再在下游重算
+        self.plugin._get_user_avatar_by_id.assert_awaited_once_with(
+            event, "234567", "qq"
+        )
+
+
+class DownloadBoundaryValidationTests(unittest.IsolatedAsyncioTestCase):
+    """下载边界自身也要校验地址（PR #18 审查：missing-url-validation-at-download-boundary）。"""
+
+    def setUp(self):
+        self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
+        self.plugin._is_terminating = False
+        self.plugin._session = None
+
+    async def test_unsanitized_url_is_rejected_before_request(self):
+        session = FakeSession([FakeResponse(200, headers={"Content-Type": "image/png"})])
+        self.plugin._session = session
+        for bad in (
+            "http://127.0.0.1/a.png",
+            "https://evil.example.com/a.png",
+            "file:///etc/passwd",
+        ):
+            with self.subTest(url=bad):
+                self.assertIsNone(await self.plugin._download_image(bad, "qq"))
+        self.assertEqual(session.calls, [])
+
+    async def test_unknown_kind_is_rejected_if_caller_forgets_kind(self):
+        session = FakeSession([FakeResponse(200, headers={"Content-Type": "image/png"})])
+        self.plugin._session = session
+        self.assertIsNone(
+            await self.plugin._download_image("https://q1.qlogo.cn/g?b=qq&nk=1&s=640")
+        )
+        self.assertEqual(session.calls, [])

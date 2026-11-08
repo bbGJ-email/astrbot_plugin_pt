@@ -165,10 +165,8 @@ class TouchHeadPlugin(star.Star):
         """实际使用的平台策略：@ 解析与头像解析共用同一份判定。
 
         - 适配器有明确平台名 → 按名字走（不认识就是 unknown，不猜）；
-        - 适配器不上报平台名 → 先看消息里的 @ 标识形态，全部是纯数字才按 QQ
-          处理；没有 @ 目标（摸自己）时用 target_id 判断，否则「不带 @ 的摸摸」
-          在未实现 get_platform_name 的适配器上永远取不到头像，与带 @ 时行为
-          不一致（PR #18 审查：self-avatar-unreachable-on-unnamed-adapter）。
+        - 适配器不上报平台名 → 以本次最终目标标识为准：纯数字按 QQ，其余按
+          平台用户标识；没有目标（分析消息里的 @ 之前）才退回看 @ 标识形态。
         - 只有平台名缺失时才会用标识形态兜底，所以具名平台不会因为发送者 ID
           是数字被误判成 QQ（PR #18 审查：platform-detection-fallback）。
         """
@@ -177,18 +175,21 @@ class TouchHeadPlugin(star.Star):
             return kind
         if self._platform_name(event):
             return "unknown"
+        # 目标标识优先：同一事件里带不带 @、@ 了几个，都不影响最终目标的判定，
+        # 避免"有 @ 时按 QQ、没有 @ 时不是 QQ"这种同一事件两种策略
+        # （PR #18 审查：target-id-ignored-in-platform-fallback）。
+        if target_id:
+            return (
+                "qq"
+                if re.fullmatch(r"[0-9]+", str(target_id).strip())
+                else "unknown"
+            )
         at_ids = [
             str(component.qq).strip()
             for component in event.get_messages()
             if isinstance(component, At)
         ]
-        if at_ids:
-            if all(re.fullmatch(r"[0-9]+", value) for value in at_ids):
-                return "qq"
-            return "unknown"
-        # 无 @ 目标（摸自己）：按本次要取头像的那个标识形态兜底。qlogo 对不存在
-        # 的号码只会返回默认头像，代价很低，比"直接放弃"更符合用户预期。
-        if target_id and re.fullmatch(r"[0-9]+", str(target_id).strip()):
+        if at_ids and all(re.fullmatch(r"[0-9]+", value) for value in at_ids):
             return "qq"
         return "unknown"
 
@@ -476,10 +477,14 @@ class TouchHeadPlugin(star.Star):
 
         logger.info(f"收到摸头杀命令: {action_desc}")
 
+        # 4. 目标确定后统一判定一次平台策略，头像获取与失败提示都用这同一个值，
+        #    避免 @ 解析与头像解析各自算出不同平台
+        #    （PR #18 审查：platform-kind-inconsistency）。
+        kind = self._effective_kind(event, target_id)
+
         try:
-            user_image = await self._get_user_avatar_by_id(event, target_id)
+            user_image = await self._get_user_avatar_by_id(event, target_id, kind)
             if user_image is None:
-                kind = self._effective_kind(event, target_id)
                 return event.plain_result(
                     "抱歉，无法获取头像，无法生成摸头杀图片"
                     f"（{self._avatar_unavailable_reason(kind, target_id, consume=True)}）。"
@@ -505,14 +510,16 @@ class TouchHeadPlugin(star.Star):
     # --- 头像获取与 GIF 生成 ---
 
     async def _get_user_avatar_by_id(
-        self, event: AstrMessageEvent, user_id: str
+        self, event: AstrMessageEvent, user_id: str, kind: str = ""
     ) -> Optional[Image.Image]:
         # 每次取头像前清空失败提示：contextvars 在任务内是复用的，只在
         # _resolve_avatar_url 里清空会漏掉 unknown 等提前返回的分支，导致上一次
         # 的飞书权限提示残留到本次回复（PR #18 审查：avatar-hint-leaks-across-tasks）。
         _AVATAR_HINT.set("")
-        # 把本次目标标识交给判定：无 @ 目标时用它兜底平台（摸自己场景）。
-        kind = self._effective_kind(event, user_id)
+        # kind 由调用方（handle_command）算好传进来，保证整个命令只用一份判定；
+        # 直接调用本函数时按本次目标标识现算（PR #18 审查：platform-kind-inconsistency）。
+        if not kind:
+            kind = self._effective_kind(event, user_id)
         try:
             url = await self._resolve_avatar_url(event, kind, user_id)
         except Exception as e:
@@ -828,13 +835,19 @@ class TouchHeadPlugin(star.Star):
         return None
 
     async def _download_image(self, url: str, kind: str = "") -> Optional[Image.Image]:
+        # 真正发起请求的边界上也复核一次：调用方可能漏掉出口校验，这里不信任
+        # 传进来的地址（PR #18 审查：missing-url-validation-at-download-boundary）。
+        safe_url = self._sanitize_avatar_url(url, kind)
+        if not safe_url:
+            logger.warning("头像下载地址未通过校验，已放弃下载")
+            return None
         try:
             session = self._require_session()
 
             # 关闭自动重定向并逐跳复核：白名单域若返回 302/307 指向 127.0.0.1、
             # 169.254.169.254 或内网地址，aiohttp 默认会直接跟随，白名单只校验
             # 首跳等于没校验（PR #18 审查：redirect-ssrf-bypass）。
-            target = url
+            target = safe_url
             response = None
             for _hop in range(self._MAX_AVATAR_REDIRECTS + 1):
                 response = await session.get(
