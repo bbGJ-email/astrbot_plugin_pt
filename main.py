@@ -5,6 +5,7 @@ import math
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import quote
 
 from PIL import Image
 import aiohttp
@@ -148,6 +149,30 @@ class TouchHeadPlugin(star.Star):
             logger.debug(f"读取多平台凭据 {key} 失败: {e}")
             return ""
 
+    @staticmethod
+    def _normalize_user_key(value) -> str:
+        """把平台用户标识归一化后再比较（去掉 @ 前缀、空白，统一小写）。"""
+        return str(value or "").strip().lstrip("@").strip().lower()
+
+    def _is_same_user(self, left, right) -> bool:
+        left_key = self._normalize_user_key(left)
+        right_key = self._normalize_user_key(right)
+        return bool(left_key) and left_key == right_key
+
+    @staticmethod
+    def _redact_secrets(text) -> str:
+        """日志脱敏：抹掉 URL / 异常文本中的 Bot Token 等凭据。"""
+        if text is None:
+            return ""
+        result = str(text)
+        for pattern, repl in (
+            (r"(bot)[0-9]+:[A-Za-z0-9_-]+", r"\1***"),
+            (r"([?&](?:access_token|token)=)[^&\s'\"<>]+", r"\1***"),
+            (r"(xox[abprs]-)[A-Za-z0-9-]+", r"\1***"),
+        ):
+            result = re.sub(pattern, repl, result, flags=re.IGNORECASE)
+        return result
+
     def _resolve_mentioned_user(
         self, event: AstrMessageEvent
     ) -> Optional[Tuple[str, str]]:
@@ -175,6 +200,13 @@ class TouchHeadPlugin(star.Star):
             # 非 QQ 平台（telegram/lark/slack 等）：self_id 是平台用户标识，
             # 不要求纯数字（telegram 是 bot 用户名）。
             self_id = raw_self
+            if not self_id:
+                try:
+                    message_obj = getattr(event, "message_obj", None)
+                    self_id = str(getattr(message_obj, "self_id", "") or "").strip()
+                except Exception as e:
+                    logger.debug(f"从 message_obj.self_id 回退解析失败: {e}")
+                    self_id = ""
 
         has_command_text = False
         for component in event.get_messages():
@@ -205,7 +237,15 @@ class TouchHeadPlugin(star.Star):
             if not has_command_text:
                 if not self_id:
                     raise ValueError("无法识别机器人账号，请使用 /摸摸 @用户 明确指定目标。")
-                if target_id == self_id:
+                if self._is_same_user(target_id, self_id):
+                    continue
+                if not is_qq:
+                    # 非 QQ 平台的 At 标识与 get_self_id 可能使用不同表示
+                    # （@用户名 vs 数字 ID），无法可靠判定是否为机器人自身；
+                    # 为避免把机器人当作被摸对象，命令前的提及一律跳过。
+                    logger.debug(
+                        f"跳过命令前的平台提及 {target_id}（无法确认是否为机器人自身）"
+                    )
                     continue
             return target_id, component.name or target_id
 
@@ -277,7 +317,10 @@ class TouchHeadPlugin(star.Star):
         try:
             url = await self._resolve_avatar_url(event, kind, user_id)
         except Exception as e:
-            logger.error(f"解析平台 {kind or '未知'} 用户 {user_id} 的头像地址失败: {e}")
+            logger.error(
+                f"解析平台 {kind or '未知'} 用户 {user_id} 的头像地址失败: "
+                f"{self._redact_secrets(e)}"
+            )
             return None
         if not url:
             logger.warning(
@@ -285,7 +328,8 @@ class TouchHeadPlugin(star.Star):
                 f"（{self._avatar_unavailable_reason(kind)}）"
             )
             return None
-        logger.info(f"下载用户头像: {url}")
+        # Telegram 的文件下载地址里带有 Bot Token，日志里必须脱敏。
+        logger.info(f"下载用户头像（平台 {kind or '未知'}）: {self._redact_secrets(url)}")
         return await self._download_image(url)
 
     def _avatar_unavailable_reason(self, kind: str) -> str:
@@ -383,19 +427,28 @@ class TouchHeadPlugin(star.Star):
         token = self._platform_config("discord_bot_token")
         if not token:
             return None
+        # Discord 用户标识是数字 snowflake，非法标识不拼进请求路径。
+        if not re.fullmatch(r"[0-9]{5,25}", str(user_id)):
+            logger.warning(f"Discord 用户标识格式非法，跳过头像获取: {user_id!r}")
+            return None
         session = self._require_session()
         async with session.get(
-            f"https://discord.com/api/v10/users/{user_id}",
+            f"https://discord.com/api/v10/users/{quote(str(user_id), safe='')}",
             headers={"Authorization": f"Bot {token}"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
+            status = resp.status
             data = await resp.json(content_type=None)
-        user = (data or {}).get("user") or (data if isinstance(data, dict) else {})
-        avatar = user.get("avatar")
-        uid = str(user.get("id") or user_id)
+        # 只有拿到带 id 的用户对象才继续，错误响应不能当成用户处理。
+        if status != 200 or not isinstance(data, dict) or not data.get("id"):
+            code = data.get("code") if isinstance(data, dict) else None
+            logger.warning(f"Discord 用户查询失败: status={status} code={code}")
+            return None
+        uid = str(data["id"])
+        avatar = data.get("avatar")
         if avatar:
             ext = ".gif" if str(avatar).startswith("a_") else ".png"
-            return f"https://cdn.discordapp.com/avatars/{uid}/{avatar}{ext}?size=256"
+            return f"https://cdn.discordapp.com/avatars/{uid}/{quote(str(avatar), safe='')}{ext}?size=256"
         try:
             index = (int(uid) >> 22) % 6
         except ValueError:
@@ -430,6 +483,9 @@ class TouchHeadPlugin(star.Star):
         app_secret = self._platform_config("feishu_app_secret")
         if not app_id or not app_secret:
             return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{3,64}", str(user_id)):
+            logger.warning(f"飞书用户标识格式非法，跳过头像获取: {user_id!r}")
+            return None
         session = self._require_session()
         async with session.post(
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -442,15 +498,32 @@ class TouchHeadPlugin(star.Star):
             logger.warning(f"飞书 tenant_access_token 获取失败: code={((data or {}).get('code'))}")
             return None
         async with session.get(
-            "https://open.feishu.cn/open-apis/contact/v3/users/" + user_id,
+            "https://open.feishu.cn/open-apis/contact/v3/users/"
+            + quote(str(user_id), safe=""),
             params={"user_id_type": "open_id"},
             headers={"Authorization": f"Bearer {token}"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
+            status = resp.status
             data = await resp.json(content_type=None)
+        if status != 200 or not isinstance(data, dict) or data.get("code") not in (0, None):
+            logger.warning(
+                f"飞书用户查询失败: status={status} code={((data or {}).get('code'))}"
+            )
+            return None
         user = (((data or {}).get("data") or {}).get("user")) or {}
         avatar = user.get("avatar") or {}
-        for key in ("avatar_240", "avatar_origin", "avatar_96"):
+        # 飞书不同版本用户对象的头像字段名不一致，按分辨率从高到低兜底。
+        for key in (
+            "avatar_origin",
+            "avatar_640",
+            "avatar_big",
+            "avatar_240",
+            "avatar_middle",
+            "avatar_thumb",
+            "avatar_96",
+            "avatar_72",
+        ):
             if avatar.get(key):
                 return str(avatar[key])
         return None
@@ -500,9 +573,9 @@ class TouchHeadPlugin(star.Star):
         except asyncio.TimeoutError:
             logger.error("下载头像超时。")
         except aiohttp.ClientError as e:
-            logger.error(f"下载头像网络错误: {e}")
+            logger.error(f"下载头像网络错误: {self._redact_secrets(e)}")
         except Exception as e:
-            logger.error(f"处理下载头像时发生意外错误: {e}")
+            logger.error(f"处理下载头像时发生意外错误: {self._redact_secrets(e)}")
 
         return None
 

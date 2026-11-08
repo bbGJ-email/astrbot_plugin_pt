@@ -308,6 +308,39 @@ class PlatformEvent(FakeEvent):
         return self._platform
 
 
+class FakeResponse:
+    def __init__(self, status=200, payload=None):
+        self.status = status
+        self._payload = payload if payload is not None else {}
+
+    async def json(self, content_type=None):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class FakeSession:
+    closed = False
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def _next(self, method, url, kwargs):
+        self.calls.append((method, url, kwargs))
+        return self._responses.pop(0)
+
+    def get(self, url, **kwargs):
+        return self._next("GET", url, kwargs)
+
+    def post(self, url, **kwargs):
+        return self._next("POST", url, kwargs)
+
+
 class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
     """issue #16：多平台适配（平台识别 / @ 解析 / 头像解析与提示）。"""
 
@@ -395,6 +428,99 @@ class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0], "text")
         self.assertIn("微信官方平台不提供用户头像", result[1])
         self.plugin._download_image.assert_not_awaited()
+
+    def test_redact_secrets_masks_credentials(self):
+        url = "https://api.telegram.org/file/bot123456:AAH-secret_token/photo/file_1.jpg"
+        redacted = self.plugin._redact_secrets(url)
+        self.assertNotIn("AAH-secret_token", redacted)
+        self.assertIn("bot***", redacted)
+        self.assertIn("file_1.jpg", redacted)
+        self.assertNotIn("1234-abcd", self.plugin._redact_secrets("xoxb-1234-abcd"))
+        self.assertNotIn(
+            "abc", self.plugin._redact_secrets("https://x/y?access_token=abc&z=1")
+        )
+        self.assertEqual(self.plugin._redact_secrets(None), "")
+
+    def test_user_key_normalization(self):
+        self.assertTrue(self.plugin._is_same_user("@MyBot", "mybot"))
+        self.assertTrue(self.plugin._is_same_user(" 100001 ", "100001"))
+        self.assertFalse(self.plugin._is_same_user("", ""))
+        self.assertFalse(self.plugin._is_same_user("@alice", "@bob"))
+
+    def test_non_qq_command_leading_mention_is_skipped(self):
+        # 命令前的 @ 在非 QQ 平台无法确认是否机器人自身，保守跳过，避免摸到机器人。
+        for platform in ("telegram", "feishu", "slack", "discord"):
+            with self.subTest(platform=platform):
+                event = PlatformEvent(
+                    [At(qq="@some_bot"), Plain(" /摸摸")], platform
+                )
+                self.assertIsNone(self.plugin._resolve_mentioned_user(event))
+
+    async def test_discord_rejects_non_snowflake_id(self):
+        self.plugin.config = {"platform_tokens": {"discord_bot_token": "t"}}
+        self.plugin._session = FakeSession([])
+        for uid in ("", "abc", "../../users", "@name", "12 34"):
+            with self.subTest(uid=uid):
+                self.assertIsNone(await self.plugin._discord_avatar_url(uid))
+        self.assertEqual(self.plugin._session.calls, [])
+
+    async def test_discord_error_response_is_not_treated_as_user(self):
+        self.plugin.config = {"platform_tokens": {"discord_bot_token": "t"}}
+        self.plugin._session = FakeSession(
+            [FakeResponse(404, {"code": 10013, "message": "Unknown User"})]
+        )
+        self.assertIsNone(await self.plugin._discord_avatar_url("123456789012345678"))
+
+    async def test_discord_falls_back_to_default_avatar(self):
+        self.plugin.config = {"platform_tokens": {"discord_bot_token": "t"}}
+        self.plugin._session = FakeSession(
+            [FakeResponse(200, {"id": "123456789012345678", "avatar": None})]
+        )
+        url = await self.plugin._discord_avatar_url("123456789012345678")
+        self.assertTrue(url.startswith("https://cdn.discordapp.com/embed/avatars/"))
+
+    async def test_discord_custom_avatar_uses_cdn_path(self):
+        self.plugin.config = {"platform_tokens": {"discord_bot_token": "t"}}
+        self.plugin._session = FakeSession(
+            [FakeResponse(200, {"id": "123456789012345678", "avatar": "a_abcdef"})]
+        )
+        url = await self.plugin._discord_avatar_url("123456789012345678")
+        self.assertEqual(
+            url,
+            "https://cdn.discordapp.com/avatars/123456789012345678/a_abcdef.gif?size=256",
+        )
+
+    async def test_feishu_accepts_variant_avatar_fields(self):
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id", "feishu_app_secret": "sec"}
+        }
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"tenant_access_token": "t-1"}),
+                FakeResponse(
+                    200,
+                    {
+                        "code": 0,
+                        "data": {"user": {"avatar": {"avatar_big": "https://feishu/big.png"}}},
+                    },
+                ),
+            ]
+        )
+        self.assertEqual(
+            await self.plugin._feishu_avatar_url("ou_abc123"), "https://feishu/big.png"
+        )
+
+    async def test_feishu_error_code_returns_none(self):
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id", "feishu_app_secret": "sec"}
+        }
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"tenant_access_token": "t-1"}),
+                FakeResponse(200, {"code": 41050, "msg": "no permission"}),
+            ]
+        )
+        self.assertIsNone(await self.plugin._feishu_avatar_url("ou_abc123"))
 
 
 class GifGenerationTests(unittest.TestCase):
