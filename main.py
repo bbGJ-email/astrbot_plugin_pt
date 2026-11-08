@@ -20,8 +20,11 @@ Image.MAX_IMAGE_PIXELS = 10_000_000
 class TouchHeadPlugin(star.Star):
     """摸头杀插件主类。"""
 
-    def __init__(self, context: star.Context):
+    def __init__(self, context: star.Context, config: Optional[dict] = None):
         super().__init__(context)
+        self.config = config if config is not None else {}
+        if config is None:
+            logger.warning("AstrBot 未注入摸头杀插件配置，将使用默认速度 1.0；请检查 AstrBot 版本及插件配置。")
         logger.info("摸头杀插件正在初始化...")
 
         self.data_dir = StarTools.get_data_dir()
@@ -273,6 +276,20 @@ class TouchHeadPlugin(star.Star):
 
         return None
 
+    def _get_frame_duration(self) -> int:
+        config = self.config if isinstance(self.config, dict) else {}
+        patpat = config.get("patpat")
+        speed = patpat.get("speed", 1.0) if isinstance(patpat, dict) else 1.0
+        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
+            logger.warning(f"无效的摸头速度 {speed!r}，使用默认速度 1.0")
+            speed = 1.0
+        elif not 0.5 <= speed <= 3.0 or not math.isfinite(speed):
+            logger.warning(f"无效的摸头速度 {speed!r}，使用默认速度 1.0")
+            speed = 1.0
+
+        # GIF 帧时长以 10 毫秒为单位，提前四舍五入避免编码时直接截断。
+        return int(100 / speed / 10 + 0.5) * 10
+
     def _build_petpet_gif(
         self, user_image: Image.Image, username: str
     ) -> Optional[Path]:
@@ -329,7 +346,7 @@ class TouchHeadPlugin(star.Star):
                     output_path,
                     save_all=True,
                     append_images=frames[1:],
-                    duration=100,
+                    duration=self._get_frame_duration(),
                     loop=0,
                     optimize=True,
                     disposal=2,

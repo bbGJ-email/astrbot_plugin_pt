@@ -77,7 +77,11 @@ def load_plugin():
         )
     }
     star = modules["astrbot.api.star"]
-    star.Star = object
+    class Star:
+        def __init__(self, context):
+            self.context = context
+
+    star.Star = Star
     star.Context = object
     star.StarTools = SimpleNamespace()
     modules["astrbot.api"].star = star
@@ -93,10 +97,42 @@ def load_plugin():
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, modules):
         spec.loader.exec_module(module)
-    return module.TouchHeadPlugin
+    return module
 
 
-TouchHeadPlugin = load_plugin()
+plugin_module = load_plugin()
+TouchHeadPlugin = plugin_module.TouchHeadPlugin
+
+
+class PluginInitializationTests(unittest.TestCase):
+    def test_missing_injected_config_logs_warning_and_uses_default_speed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                plugin_module.StarTools, "get_data_dir", create=True, return_value=Path(temp_dir)
+            ), patch.object(plugin_module.logger, "warning") as warning:
+                plugin = TouchHeadPlugin(context=object())
+            self.assertEqual(plugin.config, {})
+            warning.assert_called_once()
+            self.assertIn("未注入", warning.call_args.args[0])
+            self.assertEqual(plugin._get_frame_duration(), 100)
+
+    def test_astrbot_injected_config_is_used_for_gif_generation(self):
+        config = {"patpat": {"speed": 2.0}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                plugin_module.StarTools, "get_data_dir", create=True, return_value=Path(temp_dir)
+            ):
+                plugin = TouchHeadPlugin(context=object(), config=config)
+            self.assertIs(plugin.config, config)
+            self.assertTrue(plugin.output_dir.is_dir())
+            with Image.new("RGBA", (100, 100), "blue") as avatar:
+                gif_path = plugin._build_petpet_gif(avatar, "target")
+            self.assertIsNotNone(gif_path)
+            with Image.open(gif_path) as gif:
+                self.assertEqual(gif.n_frames, 5)
+                for index in range(gif.n_frames):
+                    gif.seek(index)
+                    self.assertEqual(gif.info["duration"], 50)
 
 
 class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -108,6 +144,7 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
         self.avatar = Image.new("RGBA", (100, 100), "blue")
         self.addCleanup(self.avatar.close)
         self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
         self.plugin._download_image = AsyncMock(return_value=self.avatar)
         self.plugin._build_petpet_gif = Mock(return_value=self.gif_path)
 
@@ -233,6 +270,22 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.plugin._download_image.assert_not_awaited()
                 self.plugin._build_petpet_gif.assert_not_called()
 
+    async def test_configured_speed_controls_gif_returned_by_command(self):
+        self.plugin.config = {"patpat": {"speed": 2.0}}
+        self.plugin.output_dir = Path(self.temp_dir.name)
+        self.plugin.assets_dir = ROOT / "data" / "petpet"
+        self.plugin._is_terminating = False
+        self.plugin._build_petpet_gif = TouchHeadPlugin._build_petpet_gif.__get__(
+            self.plugin, TouchHeadPlugin
+        )
+        result = await self.plugin.handle_command(FakeEvent([Plain("/摸摸")]))
+        self.assertEqual(result[0], "image")
+        with Image.open(result[1]) as gif:
+            self.assertEqual(gif.n_frames, 5)
+            for index in range(gif.n_frames):
+                gif.seek(index)
+                self.assertEqual(gif.info["duration"], 50)
+
     async def test_target_avatar_failure_does_not_retry_sender(self):
         self.plugin._download_image.return_value = None
         result = await self.plugin.handle_command(FakeEvent([At(qq="234567", name="目标")]))
@@ -248,6 +301,7 @@ class GifGenerationTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
         self.plugin.output_dir = Path(self.temp_dir.name)
         self.plugin.assets_dir = ROOT / "data" / "petpet"
         self.plugin._is_terminating = False
@@ -280,6 +334,42 @@ class GifGenerationTests(unittest.TestCase):
                     self.assertEqual(frame.getpixel((50, 15)), (255, 255, 255))
         for template, original in originals.items():
             self.assertEqual(template.read_bytes(), original)
+
+    def assert_duration(self, config, expected):
+        self.plugin.config = config
+        gif_path = self.plugin._build_petpet_gif(self.avatar, "target")
+        self.assertIsNotNone(gif_path)
+        with Image.open(gif_path) as gif:
+            self.assertEqual(gif.n_frames, 5)
+            for index in range(gif.n_frames):
+                gif.seek(index)
+                self.assertEqual(gif.info["duration"], expected)
+
+    def test_configured_speeds_change_each_frame_duration(self):
+        for speed, duration in ((0.5, 200), (1.0, 100), (1.5, 70), (2.0, 50), (3.0, 30)):
+            with self.subTest(speed=speed):
+                self.assert_duration({"patpat": {"speed": speed}}, duration)
+
+    def test_bad_speed_falls_back_to_default(self):
+        for speed in (None, True, False, 0, -1, float("nan"), float("inf"), "x", [], {}):
+            with self.subTest(speed=speed):
+                self.assert_duration({"patpat": {"speed": speed}}, 100)
+
+    def test_speed_outside_ui_range_falls_back_to_default(self):
+        for speed in (0.1, 0.49, 3.01, 4.0, 10**400):
+            with self.subTest(speed=speed):
+                self.assert_duration({"patpat": {"speed": speed}}, 100)
+
+    def test_missing_or_malformed_config_falls_back_to_default(self):
+        for config in (None, {}, {"patpat": None}, {"patpat": []}, {"patpat": {}}):
+            with self.subTest(config=config):
+                self.assert_duration(config, 100)
+
+    def test_changed_config_is_used_by_subsequent_gifs(self):
+        config = {"patpat": {"speed": 0.5}}
+        self.assert_duration(config, 200)
+        config["patpat"]["speed"] = 2.0
+        self.assert_duration(config, 50)
 
     def test_bundled_templates_still_produce_a_complete_gif(self):
         gif_path = self.plugin._build_petpet_gif(self.avatar, "target")
