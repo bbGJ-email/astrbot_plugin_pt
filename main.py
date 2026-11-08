@@ -111,25 +111,70 @@ class TouchHeadPlugin(star.Star):
 
         return user_id, nickname
 
+    # --- 平台识别（issue #16 多平台适配） ---
+
+    def _platform_name(self, event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_platform_name() or "").strip().lower()
+        except Exception:
+            return ""
+
+    def _platform_kind(self, event: AstrMessageEvent) -> str:
+        """把 AstrBot 平台名归一为头像获取策略：qq/telegram/discord/slack/
+        feishu/weixin/unknown。用子串匹配兼容各版本的命名差异。"""
+        name = self._platform_name(event)
+        if not name or "qq" in name or "aiocqhttp" in name:
+            return "qq"
+        if "telegram" in name or name == "tg":
+            return "telegram"
+        if "discord" in name:
+            return "discord"
+        if "slack" in name:
+            return "slack"
+        if "lark" in name or "feishu" in name:
+            return "feishu"
+        if "weixin" in name or "wechat" in name or name.startswith("wx"):
+            return "weixin"
+        return "unknown"
+
+    def _platform_config(self, key: str) -> str:
+        """读取多平台凭据配置（platform_tokens 段），未配置返回空串。"""
+        try:
+            section = self.config.get("platform_tokens") or {}
+            return str(section.get(key, "") or "").strip()
+        except AttributeError:
+            return ""
+        except Exception as e:
+            logger.debug(f"读取多平台凭据 {key} 失败: {e}")
+            return ""
+
     def _resolve_mentioned_user(
         self, event: AstrMessageEvent
     ) -> Optional[Tuple[str, str]]:
         """返回首个被 @ 用户；无目标返回 None，无效提及抛出 ValueError。"""
+        is_qq = self._platform_kind(event) == "qq"
         self_id = ""
         try:
-            self_id = str(event.get_self_id() or "").strip().lstrip("0")
+            raw_self = str(event.get_self_id() or "").strip()
         except Exception as e:
             logger.debug(f"get_self_id 不可用: {e}")
-
-        if not re.fullmatch(r"[0-9]+", self_id):
-            try:
-                message_obj = getattr(event, "message_obj", None)
-                self_id = str(getattr(message_obj, "self_id", "") or "").strip().lstrip("0")
-            except Exception as e:
-                logger.debug(f"从 message_obj.self_id 回退解析失败: {e}")
+            raw_self = ""
+        if is_qq:
+            # QQ 平台：保持原有纯数字语义（前导零归一）。
+            self_id = raw_self.lstrip("0")
+            if not re.fullmatch(r"[0-9]+", self_id):
+                try:
+                    message_obj = getattr(event, "message_obj", None)
+                    self_id = str(getattr(message_obj, "self_id", "") or "").strip().lstrip("0")
+                except Exception as e:
+                    logger.debug(f"从 message_obj.self_id 回退解析失败: {e}")
+                    self_id = ""
+            if not re.fullmatch(r"[0-9]+", self_id):
                 self_id = ""
-        if not re.fullmatch(r"[0-9]+", self_id):
-            self_id = ""
+        else:
+            # 非 QQ 平台（telegram/lark/slack 等）：self_id 是平台用户标识，
+            # 不要求纯数字（telegram 是 bot 用户名）。
+            self_id = raw_self
 
         has_command_text = False
         for component in event.get_messages():
@@ -143,11 +188,19 @@ class TouchHeadPlugin(star.Star):
             target_id = str(component.qq).strip()
             if target_id == "all":
                 raise ValueError("请 @ 一位具体用户，暂不支持 @全体成员。")
-            if not re.fullmatch(r"[0-9]+", target_id) or not target_id.strip("0"):
-                logger.warning(f"无法解析被 @ 用户的 QQ 号: {component.qq!r}")
-                raise ValueError("无法识别被 @ 用户的 QQ 号，请重新 @ 一位用户。")
+            if is_qq:
+                if not re.fullmatch(r"[0-9]+", target_id) or not target_id.strip("0"):
+                    logger.warning(f"无法解析被 @ 用户的 QQ 号: {component.qq!r}")
+                    raise ValueError("无法识别被 @ 用户的 QQ 号，请重新 @ 一位用户。")
+                target_id = target_id.lstrip("0")
+            else:
+                # issue #16：各平台 At 的 qq 字段是平台用户标识
+                # （telegram 为 @用户名、飞书为 open_id、slack 为成员 ID），
+                # 只要求非空，不做 QQ 号校验。
+                if not target_id:
+                    logger.warning(f"被 @ 用户的平台标识为空: {component.qq!r}")
+                    raise ValueError("无法识别被 @ 用户的平台标识，请重新 @ 一位用户。")
 
-            target_id = target_id.lstrip("0")
             # 命令前用于唤醒机器人的 @ 会保留在消息链中。
             if not has_command_text:
                 if not self_id:
@@ -193,7 +246,10 @@ class TouchHeadPlugin(star.Star):
         try:
             user_image = await self._get_user_avatar_by_id(event, target_id)
             if user_image is None:
-                return event.plain_result("抱歉，无法获取头像，无法生成摸头杀图片。")
+                kind = self._platform_kind(event)
+                return event.plain_result(
+                    f"抱歉，无法获取头像，无法生成摸头杀图片（{self._avatar_unavailable_reason(kind)}）。"
+                )
 
             gif_path = await asyncio.to_thread(
                 self._build_petpet_gif, user_image, target_name
@@ -217,13 +273,187 @@ class TouchHeadPlugin(star.Star):
     async def _get_user_avatar_by_id(
         self, event: AstrMessageEvent, user_id: str
     ) -> Optional[Image.Image]:
+        kind = self._platform_kind(event)
         try:
-            qq_avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
-            logger.info(f"下载用户头像: {qq_avatar_url}")
-            return await self._download_image(qq_avatar_url)
+            url = await self._resolve_avatar_url(event, kind, user_id)
         except Exception as e:
-            logger.error(f"下载用户 {user_id} 的头像失败: {e}")
+            logger.error(f"解析平台 {kind or '未知'} 用户 {user_id} 的头像地址失败: {e}")
             return None
+        if not url:
+            logger.warning(
+                f"平台 {kind or '未知'} 暂无法获取用户 {user_id} 的头像"
+                f"（{self._avatar_unavailable_reason(kind)}）"
+            )
+            return None
+        logger.info(f"下载用户头像: {url}")
+        return await self._download_image(url)
+
+    def _avatar_unavailable_reason(self, kind: str) -> str:
+        """头像不可用时给管理员的配置指引。"""
+        if kind == "qq":
+            return "QQ 头像接口异常"
+        if kind == "telegram":
+            return "请在插件配置 platform_tokens.telegram_bot_token 填写 Bot Token"
+        if kind == "discord":
+            return "请在插件配置 platform_tokens.discord_bot_token 填写 Bot Token"
+        if kind == "slack":
+            return "请在插件配置 platform_tokens.slack_bot_token 填写 Bot Token（需 users:read）"
+        if kind == "feishu":
+            return "请在插件配置 platform_tokens 里填写 feishu_app_id 与 feishu_app_secret"
+        if kind == "weixin":
+            return "微信官方平台不提供用户头像，只能摸自己的文字形象（无 GIF 头像）"
+        return "未知平台，未实现头像获取"
+
+    async def _resolve_avatar_url(
+        self, event: AstrMessageEvent, kind: str, user_id: str
+    ) -> Optional[str]:
+        """按平台解析用户头像的公开下载地址；无法获取返回 None（issue #16）。"""
+        if kind == "qq":
+            return f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
+        if kind == "telegram":
+            return await self._telegram_avatar_url(event, user_id)
+        if kind == "discord":
+            return await self._discord_avatar_url(user_id)
+        if kind == "slack":
+            return await self._slack_avatar_url(user_id)
+        if kind == "feishu":
+            return await self._feishu_avatar_url(user_id)
+        return None
+
+    def _require_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def _telegram_avatar_url(
+        self, event: AstrMessageEvent, user_id: str
+    ) -> Optional[str]:
+        """Telegram：getChatMember 解析数字 id（支持 @用户名）→
+        getUserProfilePhotos → getFile → 公开文件地址。需 Bot Token。"""
+        token = self._platform_config("telegram_bot_token")
+        if not token:
+            return None
+        base = f"https://api.telegram.org/bot{token}"
+        session = self._require_session()
+        # At 里通常是 @用户名，先换算成数字 user_id
+        if not re.fullmatch(r"-?[0-9]+", user_id):
+            chat_id = ""
+            try:
+                chat_id = str(event.get_group_id() or "")
+            except Exception:
+                pass
+            if not chat_id:
+                logger.warning("Telegram 解析头像需要群聊上下文（get_group_id 为空）")
+                return None
+            async with session.get(
+                f"{base}/getChatMember",
+                params={"chat_id": chat_id, "user_id": user_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+            member = ((data or {}).get("result") or {}).get("user") or {}
+            numeric = str(member.get("id") or "")
+            if not numeric:
+                logger.warning(f"Telegram getChatMember 未返回用户 id: {data}")
+                return None
+            user_id = numeric
+        async with session.get(
+            f"{base}/getUserProfilePhotos",
+            params={"user_id": user_id, "limit": 1},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        photos = ((data or {}).get("result") or {}).get("photos") or []
+        if not photos:
+            return None
+        file_id = photos[0][-1].get("file_id") if photos[0] else None
+        if not file_id:
+            return None
+        async with session.get(
+            f"{base}/getFile", params={"file_id": file_id},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        file_path = ((data or {}).get("result") or {}).get("file_path")
+        return f"https://api.telegram.org/file/bot{token}/{file_path}" if file_path else None
+
+    async def _discord_avatar_url(self, user_id: str) -> Optional[str]:
+        """Discord：GET /users/{id}（需 Bot Token）→ cdn 头像；无自定义头像
+        时回退默认头像（按 user_id 计算 discriminator index）。"""
+        token = self._platform_config("discord_bot_token")
+        if not token:
+            return None
+        session = self._require_session()
+        async with session.get(
+            f"https://discord.com/api/v10/users/{user_id}",
+            headers={"Authorization": f"Bot {token}"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        user = (data or {}).get("user") or (data if isinstance(data, dict) else {})
+        avatar = user.get("avatar")
+        uid = str(user.get("id") or user_id)
+        if avatar:
+            ext = ".gif" if str(avatar).startswith("a_") else ".png"
+            return f"https://cdn.discordapp.com/avatars/{uid}/{avatar}{ext}?size=256"
+        try:
+            index = (int(uid) >> 22) % 6
+        except ValueError:
+            index = 0
+        return f"https://cdn.discordapp.com/embed/avatars/{index}.png"
+
+    async def _slack_avatar_url(self, user_id: str) -> Optional[str]:
+        """Slack：users.info（需 Bot Token，scopes: users:read）→
+        profile 里的 image_* 公开 CDN 地址。"""
+        token = self._platform_config("slack_bot_token")
+        if not token:
+            return None
+        session = self._require_session()
+        async with session.post(
+            "https://slack.com/api/users.info",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"user": user_id},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        profile = ((data or {}).get("user") or {}).get("profile") or {}
+        for key in ("image_192", "image_512", "image_240", "image_original"):
+            url = profile.get(key)
+            if url:
+                return str(url)
+        return None
+
+    async def _feishu_avatar_url(self, user_id: str) -> Optional[str]:
+        """飞书：tenant_access_token（需 app_id/app_secret）→
+        contact/v3/users/{open_id} → avatar 公开地址。"""
+        app_id = self._platform_config("feishu_app_id")
+        app_secret = self._platform_config("feishu_app_secret")
+        if not app_id or not app_secret:
+            return None
+        session = self._require_session()
+        async with session.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": app_id, "app_secret": app_secret},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        token = (data or {}).get("tenant_access_token")
+        if not token:
+            logger.warning(f"飞书 tenant_access_token 获取失败: code={((data or {}).get('code'))}")
+            return None
+        async with session.get(
+            "https://open.feishu.cn/open-apis/contact/v3/users/" + user_id,
+            params={"user_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+        user = (((data or {}).get("data") or {}).get("user")) or {}
+        avatar = user.get("avatar") or {}
+        for key in ("avatar_240", "avatar_origin", "avatar_96"):
+            if avatar.get(key):
+                return str(avatar[key])
+        return None
 
     async def _download_image(self, url: str) -> Optional[Image.Image]:
         try:

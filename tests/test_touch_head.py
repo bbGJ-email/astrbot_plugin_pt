@@ -289,11 +289,112 @@ class MentionCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_target_avatar_failure_does_not_retry_sender(self):
         self.plugin._download_image.return_value = None
         result = await self.plugin.handle_command(FakeEvent([At(qq="234567", name="目标")]))
-        self.assertEqual(result, ("text", "抱歉，无法获取头像，无法生成摸头杀图片。"))
+        self.assertEqual(
+            result,
+            ("text", "抱歉，无法获取头像，无法生成摸头杀图片（QQ 头像接口异常）。"),
+        )
         self.plugin._download_image.assert_awaited_once_with(
             "https://q1.qlogo.cn/g?b=qq&nk=234567&s=640"
         )
         self.plugin._build_petpet_gif.assert_not_called()
+
+
+class PlatformEvent(FakeEvent):
+    def __init__(self, messages, platform, **kwargs):
+        super().__init__(messages, **kwargs)
+        self._platform = platform
+
+    def get_platform_name(self):
+        return self._platform
+
+
+class PlatformSupportTests(unittest.IsolatedAsyncioTestCase):
+    """issue #16：多平台适配（平台识别 / @ 解析 / 头像解析与提示）。"""
+
+    def setUp(self):
+        self.plugin = TouchHeadPlugin.__new__(TouchHeadPlugin)
+        self.plugin.config = {}
+
+    def test_platform_kind_mapping(self):
+        for platform, kind in (
+            ("", "qq"),  # 未提供平台名的适配器沿用 QQ 语义
+            ("aiocqhttp", "qq"),
+            ("qq_official", "qq"),
+            ("telegram", "telegram"),
+            ("tg", "telegram"),
+            ("discord", "discord"),
+            ("slack", "slack"),
+            ("lark", "feishu"),
+            ("feishu", "feishu"),
+            ("wechat", "weixin"),
+            ("weixin_official", "weixin"),
+            ("some_new_platform", "unknown"),
+        ):
+            with self.subTest(platform=platform):
+                event = PlatformEvent([Plain("/摸摸")], platform)
+                self.assertEqual(self.plugin._platform_kind(event), kind)
+
+    def test_non_qq_platform_accepts_non_numeric_at_id(self):
+        for platform, target in (
+            ("telegram", "@target_user"),
+            ("feishu", "ou_8c9d1e2f"),
+            ("slack", "U0G9QF9C6"),
+            ("discord", "1029384756102938475"),
+        ):
+            with self.subTest(platform=platform, target=target):
+                event = PlatformEvent(
+                    [Plain("/摸摸 "), At(qq=target, name="目标")], platform
+                )
+                resolved = self.plugin._resolve_mentioned_user(event)
+                self.assertEqual(resolved, (target, "目标"))
+
+    async def test_avatar_url_dispatches_to_platform_resolver(self):
+        event = PlatformEvent([Plain("/摸摸")], "telegram")
+        self.plugin._telegram_avatar_url = AsyncMock(return_value="https://t.example/a.jpg")
+        url = await self.plugin._resolve_avatar_url(event, "telegram", "@user")
+        self.assertEqual(url, "https://t.example/a.jpg")
+        self.plugin._telegram_avatar_url.assert_awaited_once_with(event, "@user")
+
+    async def test_avatar_url_resolvers_require_credentials(self):
+        for kind, user_id in (
+            ("telegram", "@user"),
+            ("discord", "1029384756102938475"),
+            ("slack", "U0G9QF9C6"),
+            ("feishu", "ou_8c9d1e2f"),
+        ):
+            with self.subTest(kind=kind):
+                self.plugin.config = {"platform_tokens": {}}
+                resolver = getattr(self.plugin, f"_{kind}_avatar_url")
+                if kind == "telegram":
+                    url = await resolver(PlatformEvent([Plain("/摸摸")], "telegram"), user_id)
+                else:
+                    url = await resolver(user_id)
+                self.assertIsNone(url)
+
+    async def test_unsupported_platform_has_no_avatar_url(self):
+        event = PlatformEvent([Plain("/摸摸")], "some_new_platform")
+        url = await self.plugin._resolve_avatar_url(event, "unknown", "123")
+        self.assertIsNone(url)
+
+    def test_avatar_unavailable_reason_gives_config_hint(self):
+        for kind, keyword in (
+            ("telegram", "telegram_bot_token"),
+            ("discord", "discord_bot_token"),
+            ("slack", "slack_bot_token"),
+            ("feishu", "feishu_app"),
+            ("weixin", "微信官方平台不提供用户头像"),
+            ("unknown", "未知平台"),
+        ):
+            with self.subTest(kind=kind):
+                self.assertIn(keyword, self.plugin._avatar_unavailable_reason(kind))
+
+    async def test_avatar_failure_message_includes_platform_hint(self):
+        self.plugin._download_image = AsyncMock(return_value=None)
+        event = PlatformEvent([Plain("/摸摸")], "weixin")
+        result = await self.plugin.handle_command(event)
+        self.assertEqual(result[0], "text")
+        self.assertIn("微信官方平台不提供用户头像", result[1])
+        self.plugin._download_image.assert_not_awaited()
 
 
 class GifGenerationTests(unittest.TestCase):
