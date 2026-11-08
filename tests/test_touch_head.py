@@ -1176,11 +1176,42 @@ class AvatarHintLifetimeTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config = {}
 
     async def test_avatar_hint_is_consumed_once(self):
-        # 提示读完即清，不残留到后续回复
+        # 构造用户回复时 consume=True 才清空，避免残留到后续回复
         # （PR #18 审查：avatar-hint-leaks-across-tasks）。
         plugin_module._AVATAR_HINT.set("飞书应用缺少通讯录权限")
+        self.assertIn(
+            "通讯录权限", self.plugin._avatar_unavailable_reason("feishu", consume=True)
+        )
+        self.assertNotIn(
+            "通讯录权限", self.plugin._avatar_unavailable_reason("feishu", consume=True)
+        )
+
+    async def test_logging_does_not_consume_hint(self):
+        # 只读不消费：日志读完提示仍要留给用户回复
+        # （PR #18 审查：consumed-error-hint）。
+        plugin_module._AVATAR_HINT.set("飞书应用缺少通讯录权限")
         self.assertIn("通讯录权限", self.plugin._avatar_unavailable_reason("feishu"))
-        self.assertNotIn("通讯录权限", self.plugin._avatar_unavailable_reason("feishu"))
+        self.assertIn(
+            "通讯录权限", self.plugin._avatar_unavailable_reason("feishu", consume=True)
+        )
+
+    async def test_feishu_permission_denied_reply_contains_hint(self):
+        # 完整走一遍命令：飞书 403 时最终回复必须带上权限提示
+        # （PR #18 审查：consumed-error-hint）。
+        self.plugin.config = {
+            "platform_tokens": {"feishu_app_id": "id", "feishu_app_secret": "sec"}
+        }
+        self.plugin._is_terminating = False
+        self.plugin._session = FakeSession(
+            [
+                FakeResponse(200, {"code": 0, "tenant_access_token": "t-1"}),
+                FakeResponse(403, {"code": 41050, "msg": "no permission"}),
+            ]
+        )
+        event = PlatformEvent([Plain("/摸摸")], "feishu")
+        result = await self.plugin.handle_command(event)
+        self.assertEqual(result[0], "text")
+        self.assertIn("通讯录权限", result[1])
 
     async def test_unknown_kind_path_clears_previous_hint(self):
         # kind 为 unknown 时不会进入 _resolve_avatar_url，提示必须在这里也被清掉。

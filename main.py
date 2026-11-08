@@ -481,7 +481,8 @@ class TouchHeadPlugin(star.Star):
             if user_image is None:
                 kind = self._effective_kind(event, target_id)
                 return event.plain_result(
-                    f"抱歉，无法获取头像，无法生成摸头杀图片（{self._avatar_unavailable_reason(kind, target_id)}）。"
+                    "抱歉，无法获取头像，无法生成摸头杀图片"
+                    f"（{self._avatar_unavailable_reason(kind, target_id, consume=True)}）。"
                 )
 
             gif_path = await asyncio.to_thread(
@@ -530,11 +531,19 @@ class TouchHeadPlugin(star.Star):
         logger.info(f"下载用户头像（平台 {kind or '未知'}）: {self._redact_secrets(url)}")
         return await self._download_image(url, kind)
 
-    def _avatar_unavailable_reason(self, kind: str, target_id: str = "") -> str:
-        """头像不可用时给管理员的配置指引（提示读完即清，避免跨次残留）。"""
+    def _avatar_unavailable_reason(
+        self, kind: str, target_id: str = "", consume: bool = False
+    ) -> str:
+        """头像不可用时给管理员的配置指引。
+
+        提示的「读取」与「清空」分开：日志路径只读不消费，构造用户回复时才
+        consume=True，否则日志先读一次就把提示清掉，用户回复里反而看不到
+        （PR #18 审查：consumed-error-hint）。
+        """
         reason = self._avatar_unavailable_base_reason(kind, target_id)
         hint = str(_AVATAR_HINT.get() or "").strip()
-        _AVATAR_HINT.set("")
+        if consume:
+            _AVATAR_HINT.set("")
         return f"{reason}；{hint}" if hint else reason
 
     def _avatar_unavailable_base_reason(self, kind: str, target_id: str = "") -> str:
